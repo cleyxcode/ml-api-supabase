@@ -142,7 +142,7 @@ CFG = WateringConfig()
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Siram Pintar API — Supabase",
-    description="Sistem Penyiraman Tanaman IoT — KNN + Supabase PostgreSQL (v9.0.0)",
+    description="Sistem Penyiraman Tanaman IoT — KNN + Supabase",
     version=APP_VERSION,
 )
 app.add_middleware(
