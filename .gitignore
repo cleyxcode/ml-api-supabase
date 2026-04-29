@@ -3,7 +3,5 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.env
-.env.local
 .env.production
 .vercel
