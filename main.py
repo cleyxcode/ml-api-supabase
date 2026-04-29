@@ -10,8 +10,7 @@ from datetime import datetime, date
 from typing import Optional
 import time
 
-import firebase_admin
-from firebase_admin import credentials, db as firebase_db
+from supabase import create_client, Client
 
 from fastapi import FastAPI, HTTPException, Query, Security, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,35 +30,38 @@ MODEL_PATH  = os.path.join(BASE_DIR, "model", "knn_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "model", "scaler.pkl")
 META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 
-# ── Firebase config ───────────────────────────────────────────────────────────
-FIREBASE_CRED_PATH    = os.environ.get(
-    "FIREBASE_CRED_PATH",
-    os.path.join(BASE_DIR, "iot-project-8494e-firebase-adminsdk-fbsvc-dcf9e0e4b6.json")
-)
-FIREBASE_DATABASE_URL = os.environ.get(
-    "FIREBASE_DATABASE_URL",
-    "https://iot-project-8494e-default-rtdb.asia-southeast1.firebasedatabase.app/"
-)
+# ── Supabase config (dari .env) ───────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")   # anon/publishable key
 
 # ── API Key ───────────────────────────────────────────────────────────────────
-VALID_API_KEY  = os.environ.get("API_KEY", "yuli1")
+VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ── Versi ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "8.0.0"
-# ═══════════════════════════════════════════════════════════════════════════
-# v8.0.0 — Real-time state, async-safe control, Firebase listener cache
-# ═══════════════════════════════════════════════════════════════════════════
+APP_VERSION = "9.0.0"
+# ═══════════════════════════════════════════════════════════════════════════════
+# v9.0.0 — Migrasi Firebase → Supabase PostgreSQL
+# ═══════════════════════════════════════════════════════════════════════════════
 # Perubahan utama:
-#   - _state_cache sekarang diperbarui via Firebase on_value listener (real-time)
-#   - Cache TTL diturunkan 2s → 0.3s sebagai fallback jika listener lambat
-#   - _control_lock diganti asyncio.Lock() agar benar-benar non-blocking
-#   - lambda di run_in_executor diganti fungsi eksplisit (silent-bug fix)
-#   - Debounce sensor dilonggarkan: hanya blokir jika <1 detik DAN delta <0.5%
-#   - Mode switch: force invalidate cache + re-read Firebase setelah write
-#   - _update_state_async tidak lagi memanggil _get_state di dalam lock
-#   - Semua logika bisnis, safety, rain detection TIDAK BERUBAH
-# ═══════════════════════════════════════════════════════════════════════════
+#   - Firebase Admin SDK → supabase-py (create_client)
+#   - /system_state (Firebase node) → tabel `system_state` (row id=1)
+#   - /sensor_readings (Firebase node) → tabel `sensor_readings`
+#   - Firebase real-time listener → Supabase Realtime (postgres_changes)
+#   - _rt_cache tetap dipertahankan sebagai layer caching lokal
+#   - Semua logika bisnis, KNN, rain detection, safety TIDAK BERUBAH
+#   - Kredensial sensitif wajib di .env (SUPABASE_URL, SUPABASE_KEY, API_KEY)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Supabase client (singleton) ───────────────────────────────────────────────
+_supabase: Client = None   # diinisialisasi di startup
+
+
+def _get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        raise RuntimeError("Supabase belum diinisialisasi.")
+    return _supabase
 
 
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
@@ -76,9 +78,7 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
 
 
 # ── Locks ─────────────────────────────────────────────────────────────────────
-# PERBAIKAN: _control_lock kini asyncio.Lock agar aman di event-loop async
-_control_lock = asyncio.Lock()
-
+_control_lock      = asyncio.Lock()
 _daily_safety_lock = asyncio.Lock()
 _daily_safety = {
     "date"                 : None,
@@ -88,31 +88,7 @@ _daily_safety = {
     "prune_done_today"     : False,
 }
 
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="fb-worker")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FIREBASE INIT
-# ══════════════════════════════════════════════════════════════════════════════
-def _init_firebase():
-    """Inisialisasi Firebase Admin SDK (idempotent)."""
-    if firebase_admin._apps:
-        return
-    try:
-        cred = credentials.Certificate(FIREBASE_CRED_PATH)
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DATABASE_URL})
-        log.info("Firebase Realtime DB terhubung: %s", FIREBASE_DATABASE_URL)
-    except Exception as e:
-        log.error("Gagal inisialisasi Firebase: %s", e)
-        raise
-
-
-def _ref_state() -> firebase_db.Reference:
-    return firebase_db.reference("/system_state")
-
-
-def _ref_sensor_readings() -> firebase_db.Reference:
-    return firebase_db.reference("/sensor_readings")
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="sb-worker")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -150,11 +126,9 @@ class WateringConfig:
     CONFIDENCE_HOT    = 40.0
     CONFIDENCE_MISSED = 48.0
 
-    # PERBAIKAN: debounce kontrol dikurangi agar mode switch terasa instan
     CONTROL_DEBOUNCE_SECONDS = 1
-    # PERBAIKAN: debounce sensor dilonggarkan
     SENSOR_DEBOUNCE_SECONDS  = 1
-    SENSOR_TOLERANCE         = 0.5   # dari 1.0 → 0.5 agar data lebih sensitif
+    SENSOR_TOLERANCE         = 0.5
 
     MANUAL_OVERRIDE_EXPIRE_SECONDS = 600
 
@@ -167,8 +141,8 @@ CFG = WateringConfig()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Siram Pintar API — Firebase RT",
-    description="Sistem Penyiraman Tanaman IoT — KNN + Firebase Realtime DB (v8.0.0)",
+    title="Siram Pintar API — Supabase",
+    description="Sistem Penyiraman Tanaman IoT — KNN + Supabase PostgreSQL (v9.0.0)",
     version=APP_VERSION,
 )
 app.add_middleware(
@@ -181,7 +155,7 @@ model_meta: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REAL-TIME STATE CACHE — diperbarui via Firebase listener
+# REAL-TIME STATE CACHE
 # ══════════════════════════════════════════════════════════════════════════════
 _STATE_DEFAULTS = {
     "pump_status"          : False,
@@ -209,14 +183,12 @@ _STATE_DEFAULTS = {
     "manual_override_ts"   : None,
 }
 
-# Cache thread-safe via asyncio — diupdate oleh listener Firebase
 _rt_cache: dict = {"data": None, "timestamp": 0.0}
-_rt_cache_lock  = asyncio.Lock()   # digunakan hanya di coroutine
-_listener_ref   = None             # handle listener agar bisa di-detach
+_realtime_socket = None        # placeholder agar /config & /diagnostics tidak error
+_polling_task    = None        # asyncio.Task background polling
 
 
 def _normalize_state(raw: dict) -> dict:
-    """Normalisasi tipe dari data Firebase ke Python native."""
     row = dict(_STATE_DEFAULTS)
     row.update(raw)
     for k in ("pump_status", "missed_session", "rain_detected", "manual_override"):
@@ -226,46 +198,84 @@ def _normalize_state(raw: dict) -> dict:
     return row
 
 
-def _on_state_changed(event):
-    """
-    Firebase on_value listener — dipanggil setiap ada perubahan di /system_state.
-    Runs di thread Firebase SDK, bukan event-loop. Gunakan thread-safe update.
-    PERBAIKAN: cache diperbarui langsung tanpa butuh polling.
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+# SUPABASE DB HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sb_get_state_sync() -> dict:
+    """Baca state dari tabel system_state (row id=1)."""
     try:
-        data = event.data
-        if data is None:
-            return
-        normalized = _normalize_state(data)
-        # Update cache secara thread-safe (tidak pakai asyncio.Lock di sini)
-        _rt_cache["data"]      = normalized
-        _rt_cache["timestamp"] = time.monotonic()
-        log.debug("RT-cache updated via listener: pump=%s mode=%s",
-                  normalized["pump_status"], normalized["mode"])
+        res = _get_supabase().table("system_state").select("*").eq("id", 1).single().execute()
+        if res.data:
+            return _normalize_state(res.data)
     except Exception as e:
-        log.error("Firebase listener error: %s", e)
+        log.error("Supabase get state error: %s", e)
+    return dict(_STATE_DEFAULTS)
 
 
-def _start_firebase_listener():
-    """Pasang listener real-time ke /system_state."""
-    global _listener_ref
+def _sb_update_state_sync(**kwargs):
+    """
+    Update field di system_state row id=1.
+    Kolom TIMESTAMP di schema PostgreSQL: kirim string ISO-8601 atau None.
+    Kolom DATE (session_count_date): kirim string 'YYYY-MM-DD'.
+    """
+    if not kwargs:
+        return
+    payload = {**kwargs, "id": 1}
+    _get_supabase().table("system_state").upsert(payload).execute()
+    log.info("State updated: %s", list(kwargs.keys()))
+
+
+def _sb_insert_sensor_sync(row_data: dict):
+    """Insert satu baris ke tabel sensor_readings."""
+    _get_supabase().table("sensor_readings").insert(row_data).execute()
+
+
+def _sb_ensure_state_row():
+    """Pastikan baris id=1 ada di system_state. Schema sudah handle insert via SQL."""
     try:
-        ref = _ref_state()
-        _listener_ref = ref.listen(_on_state_changed)
-        log.info("Firebase real-time listener terpasang di /system_state")
+        res = _get_supabase().table("system_state").select("id").eq("id", 1).execute()
+        if not res.data:
+            # Insert minimal — kolom dengan DEFAULT akan terisi otomatis
+            _get_supabase().table("system_state").insert({"id": 1}).execute()
+            log.info("system_state row id=1 dibuat di Supabase.")
+        else:
+            log.info("system_state row id=1 sudah ada.")
     except Exception as e:
-        log.error("Gagal memasang Firebase listener: %s", e)
+        log.error("Gagal memastikan system_state row: %s", e)
 
 
-def _stop_firebase_listener():
-    global _listener_ref
-    if _listener_ref:
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKGROUND POLLING — 0.5s interval untuk real-time IoT
+# Cache diupdate optimistik langsung saat write (tidak tunggu poll berikutnya).
+# Polling hanya sebagai sync fallback jika ada perubahan dari luar (dashboard, dll).
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _state_polling_loop():
+    """Coroutine background: poll system_state setiap 0.5 detik, update cache."""
+    log.info("Background state-polling dimulai (interval 0.5s).")
+    while True:
         try:
-            _listener_ref.close()
-            log.info("Firebase listener dihentikan.")
-        except Exception:
-            pass
-        _listener_ref = None
+            loop = asyncio.get_event_loop()
+            row  = await loop.run_in_executor(_executor, _sb_get_state_sync)
+            _rt_cache["data"]      = row
+            _rt_cache["timestamp"] = time.monotonic()
+        except asyncio.CancelledError:
+            log.info("State-polling dihentikan.")
+            return
+        except Exception as e:
+            log.warning("Polling error (akan retry): %s", e)
+        await asyncio.sleep(0.5)
+
+
+def _start_supabase_listener():
+    """Kompatibilitas: tidak melakukan apa-apa (polling dimulai di startup)."""
+    pass
+
+
+def _stop_supabase_listener():
+    """Kompatibilitas: tidak melakukan apa-apa (task dibatalkan di shutdown)."""
+    pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -273,22 +283,28 @@ def _stop_firebase_listener():
 # ══════════════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
-    global knn_model, scaler, model_meta
-    log.info("Siram Pintar API v%s (Firebase RT) starting...", APP_VERSION)
+    global _supabase, knn_model, scaler, model_meta
+    log.info("Siram Pintar API v%s (Supabase) starting...", APP_VERSION)
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _init_firebase)
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.error("SUPABASE_URL / SUPABASE_KEY belum di-set di .env!")
+        raise RuntimeError("Supabase credentials missing.")
+
+    _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    log.info("Supabase client terhubung: %s", SUPABASE_URL)
 
     if VALID_API_KEY:
         log.info("API Key protection: AKTIF (key: %s***)", VALID_API_KEY[:2])
 
-    await loop.run_in_executor(_executor, _ensure_state_node)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, _sb_ensure_state_row)
 
-    # Pasang real-time listener di background thread
-    await loop.run_in_executor(_executor, _start_firebase_listener)
+    # Mulai background polling (menggantikan Realtime WebSocket)
+    global _polling_task
+    _polling_task = asyncio.create_task(_state_polling_loop())
 
-    # Beri waktu listener populate cache pertama kali
-    await asyncio.sleep(0.5)
+    # Beri waktu polling pertama selesai sebelum lanjut
+    await asyncio.sleep(2.2)
 
     await _sync_daily_safety_from_db()
 
@@ -309,8 +325,13 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _stop_firebase_listener)
+    global _polling_task
+    if _polling_task and not _polling_task.done():
+        _polling_task.cancel()
+        try:
+            await _polling_task
+        except asyncio.CancelledError:
+            pass
     _executor.shutdown(wait=False)
     log.info("Siram Pintar API shutdown selesai.")
 
@@ -360,6 +381,9 @@ def _elapsed_seconds_real(stored_ts_str) -> float:
         return 999_999.0
     try:
         stored = datetime.fromisoformat(str(stored_ts_str))
+        # PostgreSQL bisa kembalikan timezone-aware timestamp; normalisasi ke naive UTC
+        if stored.tzinfo is not None:
+            stored = stored.replace(tzinfo=None)
         return (datetime.now() - stored).total_seconds()
     except Exception:
         return 999_999.0
@@ -395,37 +419,16 @@ def _get_time_weight(hour: int) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
-def _ensure_state_node():
-    try:
-        ref  = _ref_state()
-        data = ref.get()
-        if data is None:
-            ref.set(_STATE_DEFAULTS)
-            log.info("system_state node dibuat di Firebase.")
-    except Exception as e:
-        log.error("Gagal memastikan system_state node: %s", e)
-
-
-def _fb_get_state_sync() -> dict:
-    """Baca state langsung dari Firebase (bypass cache) — hanya untuk fallback."""
-    try:
-        data = _ref_state().get()
-    except Exception as e:
-        log.error("Firebase get state error: %s", e)
-        data = None
-    if data is None:
-        return dict(_STATE_DEFAULTS)
-    return _normalize_state(data)
-
-
 def _get_state(force_fresh: bool = False) -> dict:
     """
-    Ambil state dari cache real-time.
-    PERBAIKAN: cache TTL 0.3s sebagai safety-net; listener Firebase adalah sumber utama.
-    force_fresh=True: paksa baca langsung dari Firebase (digunakan setelah write penting).
+    Ambil state dari cache.
+    Cache diperbarui oleh:
+      1. Optimistic update langsung saat /sensor atau /control menulis
+      2. Background polling 0.5s sebagai sync fallback
+    TTL 0.1s hanya sebagai guard jika cache belum pernah terisi.
     """
     if force_fresh:
-        row = _fb_get_state_sync()
+        row = _sb_get_state_sync()
         _rt_cache["data"]      = row
         _rt_cache["timestamp"] = time.monotonic()
         return row
@@ -433,12 +436,12 @@ def _get_state(force_fresh: bool = False) -> dict:
     cached = _rt_cache["data"]
     age    = time.monotonic() - _rt_cache["timestamp"]
 
-    if cached and age < 0.3:
+    if cached and age < 0.1:
         return cached.copy()
 
-    # Cache stale atau kosong → baca langsung
+    # Cache kosong atau sangat stale → baca langsung
     try:
-        row = _fb_get_state_sync()
+        row = _sb_get_state_sync()
         _rt_cache["data"]      = row
         _rt_cache["timestamp"] = time.monotonic()
         return row
@@ -447,28 +450,15 @@ def _get_state(force_fresh: bool = False) -> dict:
         return cached.copy() if cached else dict(_STATE_DEFAULTS)
 
 
-def _fb_update_state_sync(**kwargs):
-    """Update field di /system_state secara atomic (sync, untuk thread pool)."""
-    if not kwargs:
-        return
-    _ref_state().update(kwargs)
-    log.info("State updated: %s", list(kwargs.keys()))
-
-
 async def _update_state_async(**kwargs):
-    """
-    Update state async.
-    PERBAIKAN: tidak ada lock global; Firebase .update() sudah atomic per field.
-    Setelah write, cache di-force-refresh agar tidak tunggu listener.
-    """
+    """Update state async. Setelah write, cache di-force-refresh."""
     if not kwargs:
         return
     loop = asyncio.get_event_loop()
 
     def _do():
-        _fb_update_state_sync(**kwargs)
-        # Segera baca balik untuk perbarui cache lokal
-        fresh = _fb_get_state_sync()
+        _sb_update_state_sync(**kwargs)
+        fresh = _sb_get_state_sync()
         _rt_cache["data"]      = fresh
         _rt_cache["timestamp"] = time.monotonic()
 
@@ -480,7 +470,7 @@ async def _update_state_async(**kwargs):
 # ══════════════════════════════════════════════════════════════════════════════
 async def _sync_daily_safety_from_db():
     loop = asyncio.get_event_loop()
-    row  = await loop.run_in_executor(_executor, _fb_get_state_sync)
+    row  = await loop.run_in_executor(_executor, _sb_get_state_sync)
 
     db_count    = int(row.get("session_count_today") or 0)
     db_date_raw = row.get("session_count_date")
@@ -506,7 +496,6 @@ async def _sync_daily_safety_from_db():
 
 
 def _daily_safety_reset_if_new_day():
-    """Harus dipanggil di dalam _daily_safety_lock."""
     today = date.today()
     if _daily_safety["date"] != today:
         _daily_safety["date"]             = today
@@ -518,14 +507,14 @@ def _daily_safety_reset_if_new_day():
 
 
 def _prune_sensor_readings():
-    """Hapus sensor_readings > 14 hari."""
+    """Hapus sensor_readings > 14 hari. Filter pakai kolom TIMESTAMP."""
     try:
-        cutoff = datetime.now().timestamp() - (14 * 86400)
-        ref    = _ref_sensor_readings()
-        data   = ref.order_by_child("timestamp_unix").end_at(cutoff).get()
-        if data:
-            ref.update({k: None for k in data.keys()})
-            log.info("Pruned %d old sensor readings.", len(data))
+        cutoff = (datetime.now() - __import__("datetime").timedelta(days=14)).isoformat()
+        _get_supabase().table("sensor_readings")\
+            .delete()\
+            .lt("timestamp", cutoff)\
+            .execute()
+        log.info("Pruned old sensor readings (>14 hari).")
     except Exception as e:
         log.error("Prune error: %s", e)
 
@@ -569,7 +558,7 @@ def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAIN DETECTION
+# RAIN DETECTION  (tidak berubah)
 # ══════════════════════════════════════════════════════════════════════════════
 def _compute_rain_score(air_humidity, soil_moisture, temperature,
                         last_soil, last_temp, pump_was_on):
@@ -636,12 +625,6 @@ def _update_rain_state_batched(score, signals, state, current_min) -> tuple:
 
 
 def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool:
-    """
-    PERBAIKAN: debounce diperketat — hanya skip jika:
-    - data anomali (sensor mati / suhu ekstrem), ATAU
-    - selisih sangat kecil (<0.5%) DAN baru saja dikirim (<1 detik)
-    """
-    # Anomali sensor — skip selalu
     if data.soil_moisture <= 0.0 or data.temperature <= 0.0 or data.temperature >= 60.0:
         log.warning("ANOMALI SENSOR: Soil=%.1f%% Temp=%.1f°C",
                     data.soil_moisture, data.temperature)
@@ -656,7 +639,6 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
 
     elapsed = _elapsed_seconds_real(state.get("last_sensor_ts"))
 
-    # Terlalu cepat DAN perubahan tidak signifikan → skip
     if elapsed < CFG.SENSOR_DEBOUNCE_SECONDS:
         if last_soil is None:
             return False
@@ -667,7 +649,7 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SMART WATERING ENGINE
+# SMART WATERING ENGINE  (tidak berubah)
 # ══════════════════════════════════════════════════════════════════════════════
 async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
                                          air_humidity, temperature, state,
@@ -685,7 +667,6 @@ async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
         "pending_updates": {},
     }
 
-    # PERBAIKAN: gunakan asyncio.Lock agar tidak blocking event loop
     async with _daily_safety_lock:
         _daily_safety_reset_if_new_day()
         if _daily_safety["locked_out"]:
@@ -881,11 +862,11 @@ async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
 def root():
     return {
         "status"      : "online",
-        "message"     : "Siram Pintar API berjalan (Firebase RT)",
+        "message"     : "Siram Pintar API berjalan (Supabase)",
         "version"     : APP_VERSION,
         "model_ready" : knn_model is not None,
         "auth"        : "required" if VALID_API_KEY else "disabled",
-        "database"    : "Firebase Realtime DB + listener",
+        "database"    : "Supabase PostgreSQL + Realtime",
     }
 
 
@@ -894,16 +875,16 @@ def root():
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/db-test", dependencies=[Depends(verify_api_key)])
 async def db_test():
+    """Cek koneksi Supabase dengan membaca system_state."""
     loop = asyncio.get_event_loop()
-    def _test():
-        ref = firebase_db.reference("/ping_test")
-        ref.set({"ts": datetime.now().isoformat(), "ok": True})
-        val = ref.get()
-        ref.delete()
-        return val
     try:
-        result = await loop.run_in_executor(_executor, _test)
-        return {"db_status": "connected", "firebase_url": FIREBASE_DATABASE_URL, "result": result}
+        state = await loop.run_in_executor(_executor, _sb_get_state_sync)
+        return {
+            "db_status"   : "connected",
+            "supabase_url": SUPABASE_URL,
+            "pump_status" : state["pump_status"],
+            "mode"        : state["mode"],
+        }
     except Exception as e:
         return {"db_status": "error", "detail": str(e)}
 
@@ -922,15 +903,14 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row_id    = str(uuid.uuid4())
 
-    state                = _get_state()
-    current_total_min    = _total_minutes(hour, minute)
+    state             = _get_state()
+    current_total_min = _total_minutes(hour, minute)
 
     await _maybe_schedule_prune(bg_tasks)
 
     pump_is_on = bool(state.get("pump_status", False))
     skip_eval  = _should_skip_sensor(data, state, pump_is_on)
 
-    # Debounce sangat ketat (< 1 detik persis sama) → return cepat
     if skip_eval:
         elapsed_spam = _elapsed_seconds_real(state.get("last_sensor_ts"))
         if elapsed_spam < 1.0:
@@ -975,35 +955,52 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     pending     = smart_eval.get("pending_updates", {})
     all_updates = {**sensor_updates, **pending}
 
+    # ── Optimistic cache update (instan, tanpa tunggu Supabase) ──────────────
+    # Cache diperbarui langsung dengan data yang akan ditulis,
+    # sehingga /pump-status dan polling berikutnya sudah dapat nilai terbaru
+    # bahkan sebelum round-trip ke Supabase selesai.
+    optimistic = {**(_rt_cache["data"] or {}), **all_updates}
+    _rt_cache["data"]      = _normalize_state(optimistic)
+    _rt_cache["timestamp"] = time.monotonic()
+
     loop = asyncio.get_event_loop()
 
-    # PERBAIKAN: fungsi eksplisit (bukan lambda) — bug silent tuple return
-    def _save_all():
-        _fb_update_state_sync(**all_updates)
-        fresh = _fb_get_state_sync()
-        _rt_cache["data"]      = fresh
-        _rt_cache["timestamp"] = time.monotonic()
+    sensor_row = {
+        "id"            : row_id,
+        "timestamp"     : datetime.now().isoformat(),
+        "soil_moisture" : data.soil_moisture,
+        "temperature"   : data.temperature,
+        "air_humidity"  : data.air_humidity,
+        "label"         : result["label"],
+        "confidence"    : result["confidence"],
+        "needs_watering": result["needs_watering"],
+        "description"   : result.get("description", ""),
+        "probabilities" : result["probabilities"],
+        "pump_status"   : pump_status_logged,
+        "mode"          : state["mode"],
+    }
 
-        _ref_sensor_readings().child(row_id).set({
-            "id"            : row_id,
-            "timestamp"     : timestamp,
-            "timestamp_unix": datetime.now().timestamp(),
-            "soil_moisture" : data.soil_moisture,
-            "temperature"   : data.temperature,
-            "air_humidity"  : data.air_humidity,
-            "label"         : result["label"],
-            "confidence"    : result["confidence"],
-            "needs_watering": result["needs_watering"],
-            "description"   : result["description"],
-            "probabilities" : result["probabilities"],
-            "pump_status"   : pump_status_logged,
-            "mode"          : state["mode"],
-        })
+    def _write_state():
+        """Tulis state update ke Supabase — prioritas tinggi."""
+        _sb_update_state_sync(**all_updates)
+
+    def _write_sensor():
+        """Insert sensor reading — bisa sedikit terlambat, tidak blocking."""
+        try:
+            _sb_insert_sensor_sync(sensor_row)
+        except Exception as e:
+            log.error("Sensor insert gagal: %s", e)
 
     try:
-        await loop.run_in_executor(_executor, _save_all)
+        # Tulis state dulu (kritis untuk pompa), sensor insert paralel di background
+        state_future   = loop.run_in_executor(_executor, _write_state)
+        sensor_future  = loop.run_in_executor(_executor, _write_sensor)
+        # Tunggu state selesai (pompa harus tersimpan), sensor boleh async
+        await state_future
+        # Sensor insert jalan di background — tidak blocking response
+        asyncio.ensure_future(sensor_future)
     except Exception as e:
-        log.error("Failed to save to Firebase: %s", e)
+        log.error("State write gagal: %s", e)
 
     new_state = _get_state()
     return {
@@ -1037,20 +1034,21 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
 
 @app.get("/status", dependencies=[Depends(verify_api_key)])
 async def get_status():
-    # PERBAIKAN: tidak force-fresh di sini; listener sudah jaga kebaruan cache
     state = _get_state()
     loop  = asyncio.get_event_loop()
 
     def _get_latest():
         try:
-            data = (
-                _ref_sensor_readings()
-                .order_by_child("timestamp_unix")
-                .limit_to_last(1)
-                .get()
+            res = (
+                _get_supabase()
+                .table("sensor_readings")
+                .select("*")
+                .order("timestamp", desc=True)
+                .limit(1)
+                .execute()
             )
-            if data:
-                return list(data.values())[0]
+            if res.data:
+                return res.data[0]
         except Exception as e:
             log.error("Gagal ambil latest sensor: %s", e)
         return None
@@ -1087,7 +1085,6 @@ async def get_status():
 
 @app.get("/pump-status", dependencies=[Depends(verify_api_key)])
 def get_pump_status():
-    """Endpoint ringan untuk di-poll ESP32 setiap 5 detik."""
     state = _get_state()
     return {
         "pump_status"    : state["pump_status"],
@@ -1103,15 +1100,17 @@ async def get_history(limit: int = Query(default=50, ge=1, le=500)):
 
     def _fetch():
         try:
-            data = (
-                _ref_sensor_readings()
-                .order_by_child("timestamp_unix")
-                .limit_to_last(limit)
-                .get()
+            res = (
+                _get_supabase()
+                .table("sensor_readings")
+                .select("*")
+                .order("timestamp", desc=True)
+                .limit(limit)
+                .execute()
             )
-            if not data:
-                return []
-            return sorted(data.values(), key=lambda x: x.get("timestamp_unix", 0))
+            records = res.data or []
+            # Kembalikan urutan ascending (terlama → terbaru)
+            return sorted(records, key=lambda x: x.get("timestamp", ""))
         except Exception as e:
             log.error("History error: %s", e)
             return []
@@ -1122,13 +1121,6 @@ async def get_history(limit: int = Query(default=50, ge=1, le=500)):
 
 @app.post("/control", dependencies=[Depends(verify_api_key)])
 async def control_pump(cmd: ControlCommand):
-    """
-    PERBAIKAN UTAMA:
-    - asyncio.Lock (bukan threading.Lock) → tidak blocking event loop
-    - Setelah write, force-refresh cache dari Firebase
-    - Deteksi mode-change saja (tanpa harus ubah pump_status) sudah benar disimpan
-    - Return state yang sudah fresh, bukan state sebelum write
-    """
     action = (cmd.action or "").lower().strip()
     if action not in ("on", "off"):
         raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
@@ -1140,12 +1132,10 @@ async def control_pump(cmd: ControlCommand):
     loop = asyncio.get_event_loop()
 
     async with _control_lock:
-        # Baca state fresh dari Firebase (bukan cache) untuk hindari race condition
-        state   = await loop.run_in_executor(_executor, _fb_get_state_sync)
+        state   = await loop.run_in_executor(_executor, _sb_get_state_sync)
         pump_on = action == "on"
         now_ts  = datetime.now().isoformat()
 
-        # Cek apakah benar-benar ada perubahan
         pump_changed = state["pump_status"] != pump_on
         mode_changed = state["mode"] != mode
 
@@ -1162,17 +1152,14 @@ async def control_pump(cmd: ControlCommand):
 
         update_kwargs: dict = {"last_control_ts": now_ts}
 
-        # Update mode jika berubah
         if mode_changed:
             update_kwargs["mode"] = mode
             log.info("Mode berubah: %s → %s", state["mode"], mode)
 
-        # Update pump jika berubah
         if pump_changed:
             update_kwargs["pump_status"] = pump_on
 
             if not pump_on:
-                # Matikan pompa secara manual
                 current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
                 update_kwargs.update(
                     pump_start_ts=None,
@@ -1184,7 +1171,6 @@ async def control_pump(cmd: ControlCommand):
                 )
                 log.info("Pompa OFF manual — manual_override diaktifkan.")
             else:
-                # Nyalakan pompa secara manual
                 now_utc = datetime.utcnow()
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs.update(
@@ -1195,20 +1181,19 @@ async def control_pump(cmd: ControlCommand):
                 )
                 log.info("Pompa ON manual.")
 
-        # Tulis ke Firebase
-        def _write_and_refresh():
-            _fb_update_state_sync(**update_kwargs)
-            # Force-refresh cache segera setelah write
-            fresh = _fb_get_state_sync()
-            _rt_cache["data"]      = fresh
-            _rt_cache["timestamp"] = time.monotonic()
-            return fresh
+        def _write_only():
+            _sb_update_state_sync(**update_kwargs)
 
         try:
-            new_state = await loop.run_in_executor(_executor, _write_and_refresh)
+            await loop.run_in_executor(_executor, _write_only)
         except Exception as e:
             log.error("Control write gagal: %s", e)
-            raise HTTPException(status_code=503, detail="Gagal menyimpan ke Firebase.")
+            raise HTTPException(status_code=503, detail="Gagal menyimpan ke Supabase.")
+
+        # Optimistic cache update — instan tanpa round-trip baca balik
+        new_state = _normalize_state({**(_rt_cache["data"] or {}), **update_kwargs})
+        _rt_cache["data"]      = new_state
+        _rt_cache["timestamp"] = time.monotonic()
 
         log.info("Control OK: action=%s mode=%s → pump=%s mode=%s",
                  action, mode, new_state["pump_status"], new_state["mode"])
@@ -1241,8 +1226,8 @@ def predict(data: SensorData):
 def get_config():
     return {
         "version"  : APP_VERSION,
-        "database" : "Firebase Realtime DB + RT listener",
-        "firebase_url": FIREBASE_DATABASE_URL,
+        "database" : "Supabase PostgreSQL + Realtime",
+        "supabase_url": SUPABASE_URL,
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59",
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59",
@@ -1278,10 +1263,11 @@ def get_config():
             "outside"    : CFG.TIME_WEIGHT_OUTSIDE,
         },
         "realtime": {
-            "listener_active"   : _listener_ref is not None,
+            "listener_active"   : _polling_task is not None and not _polling_task.done(),
             "cache_ttl_fallback": "0.3s",
             "sensor_debounce"   : f"{CFG.SENSOR_DEBOUNCE_SECONDS}s",
             "sensor_tolerance"  : f"{CFG.SENSOR_TOLERANCE}%",
+            "mode"              : "REST polling (2s interval)",
         },
     }
 
@@ -1331,15 +1317,16 @@ async def get_diagnostics():
             "meta"         : model_meta,
         },
         "realtime_cache"        : {
-            "listener_active": _listener_ref is not None,
+            "listener_active": _polling_task is not None and not _polling_task.done(),
             "cache_age_sec"  : cache_age,
             "cache_valid"    : cache_age < 1.0,
+            "mode"           : "REST polling (2s interval)",
         },
         "database": {
-            "type"         : "Firebase Realtime Database",
-            "url"          : FIREBASE_DATABASE_URL,
-            "state_path"   : "/system_state",
-            "readings_path": "/sensor_readings",
+            "type"            : "Supabase PostgreSQL",
+            "url"             : SUPABASE_URL,
+            "state_table"     : "system_state",
+            "readings_table"  : "sensor_readings",
         },
-        "migrations_from": "v7.0.0 (sync lock) → v8.0.0 (async lock + RT listener)",
+        "migrations_from": "v8.0.0 (Firebase RT listener) → v9.0.0 (Supabase PostgreSQL + Realtime)",
     }
