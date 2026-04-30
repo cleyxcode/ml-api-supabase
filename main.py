@@ -1072,6 +1072,7 @@ async def get_status():
         "manual_override" : state.get("manual_override", False),
         "watering_today"  : watering_today,
         "safety_locked"   : locked_out,
+        "last_watered_ts" : str(state["last_watered_ts"]) if state.get("last_watered_ts") else None,
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59 WIT",
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59 WIT",
