@@ -991,6 +991,7 @@ async def control_pump(cmd: ControlCommand):
             update_kwargs["pump_status"] = pump_on
 
             if not pump_on:
+                # ── Pompa dimatikan manual ────────────────────────────────
                 current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
                 update_kwargs.update(
                     pump_start_ts=None,
@@ -1000,7 +1001,10 @@ async def control_pump(cmd: ControlCommand):
                     manual_override=True,
                     manual_override_ts=now_ts,
                 )
+                log.info("Pompa OFF manual — manual_override diaktifkan.")
+
             else:
+                # ── Pompa dinyalakan manual ───────────────────────────────
                 now_utc = datetime.utcnow()
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs.update(
@@ -1009,6 +1013,25 @@ async def control_pump(cmd: ControlCommand):
                     manual_override=False,
                     manual_override_ts=None,
                 )
+
+                async with _daily_safety_lock:
+                    _daily_safety_reset_if_new_day()
+
+               
+                    if _daily_safety["locked_out"]:
+                        raise HTTPException(
+                            status_code=429,
+                            detail="Safety lockout: batas penyiraman harian (10x) tercapai."
+                        )
+
+                    _daily_safety["watering_count"] += 1
+                    new_count = _daily_safety["watering_count"]
+                    if new_count >= 10:
+                        _daily_safety["locked_out"] = True
+
+                update_kwargs["session_count_today"] = new_count
+                update_kwargs["session_count_date"]  = date.today().isoformat()
+                log.info("Pompa ON manual — sesi ke-%d hari ini.", new_count)
 
         def _write_only():
             _sb_update_state_sync(**update_kwargs)
@@ -1019,17 +1042,22 @@ async def control_pump(cmd: ControlCommand):
             log.error("Control write gagal: %s", e)
             raise HTTPException(status_code=503, detail="Gagal menyimpan ke Supabase.")
 
+        # Optimistic cache update
         new_state = _normalize_state({**(_rt_cache["data"] or {}), **update_kwargs})
         _rt_cache["data"]      = new_state
         _rt_cache["timestamp"] = time.monotonic()
 
+        log.info("Control OK: action=%s mode=%s → pump=%s",
+                 action, mode, new_state["pump_status"])
+
         return {
-            "success"        : True,
-            "debounced"      : False,
-            "pump_status"    : new_state["pump_status"],
-            "mode"           : new_state["mode"],
-            "manual_override": new_state.get("manual_override", False),
-            "timestamp"      : now_ts,
+            "success"         : True,
+            "debounced"       : False,
+            "pump_status"     : new_state["pump_status"],
+            "mode"            : new_state["mode"],
+            "manual_override" : new_state.get("manual_override", False),
+            "watering_today"  : _daily_safety["watering_count"],
+            "timestamp"       : now_ts,
         }
 
 
