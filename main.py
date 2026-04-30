@@ -1115,25 +1115,63 @@ async def get_status():
 
 
 @app.get("/history", dependencies=[Depends(verify_api_key)])
-async def get_history(limit: int = Query(default=50, ge=1, le=500)):
-    """Riwayat data sensor untuk grafik dashboard."""
+async def get_history(
+    limit     : int  = Query(default=50, ge=1, le=500),
+    pump_only : bool = Query(default=False, description="Jika True, hanya tampilkan data saat pompa ON"),
+):
+    """
+    Riwayat data sensor untuk grafik dan tabel dashboard.
+
+    Perubahan v9.2.0:
+    - Tambah field `status_tanah` yang diturunkan dari `label`
+      (Kering / Lembab / Basah) agar frontend tidak perlu mapping sendiri.
+    - Tambah query param `pump_only` untuk filter data pompa ON saja,
+      sehingga sesi penyiraman mudah ditelusuri.
+    - Urutan tetap ascending (terlama → terbaru) untuk kebutuhan grafik.
+    """
     loop = asyncio.get_event_loop()
+
+    # Mapping label KNN → status tanah yang ditampilkan di dashboard
+    LABEL_TO_STATUS = {
+        "Kering": "Kering",
+        "Lembab": "Lembab",
+        "Basah" : "Basah",
+    }
 
     def _fetch():
         try:
-            res = (
+            query = (
                 _get_supabase()
                 .table("sensor_readings")
                 .select("*")
                 .order("timestamp", desc=True)
                 .limit(limit)
-                .execute()
             )
+
+            # [FIX] Filter pompa ON jika diminta frontend
+            if pump_only:
+                query = query.eq("pump_status", True)
+
+            res     = query.execute()
             records = res.data or []
-            return sorted(records, key=lambda x: x.get("timestamp", ""))
+
+            # Kembalikan ascending (terlama → terbaru) untuk grafik
+            records = sorted(records, key=lambda x: x.get("timestamp", ""))
+
+            # [FIX] Tambah field status_tanah dari label
+            for r in records:
+                label           = r.get("label") or ""
+                r["status_tanah"] = LABEL_TO_STATUS.get(label, "-")
+
+            return records
+
         except Exception as e:
             log.error("History error: %s", e)
             return []
 
     records = await loop.run_in_executor(_executor, _fetch)
-    return {"total": len(records), "records": records}
+    return {
+        "total"    : len(records),
+        "pump_only": pump_only,
+        "records"  : records,
+    }
