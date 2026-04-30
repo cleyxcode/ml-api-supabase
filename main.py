@@ -30,31 +30,24 @@ MODEL_PATH  = os.path.join(BASE_DIR, "model", "knn_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "model", "scaler.pkl")
 META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 
-# ── Supabase config (dari .env) ───────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")   # anon/publishable key
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# ── Versi ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "9.0.0"
+APP_VERSION = "9.1.0"
 # ═══════════════════════════════════════════════════════════════════════════════
-# v9.0.0 — Migrasi Firebase → Supabase PostgreSQL
-# ═══════════════════════════════════════════════════════════════════════════════
-# Perubahan utama:
-#   - Firebase Admin SDK → supabase-py (create_client)
-#   - /system_state (Firebase node) → tabel `system_state` (row id=1)
-#   - /sensor_readings (Firebase node) → tabel `sensor_readings`
-#   - Firebase real-time listener → Supabase Realtime (postgres_changes)
-#   - _rt_cache tetap dipertahankan sebagai layer caching lokal
-#   - Semua logika bisnis, KNN, rain detection, safety TIDAK BERUBAH
-#   - Kredensial sensitif wajib di .env (SUPABASE_URL, SUPABASE_KEY, API_KEY)
+# v9.1.0 — Production cleanup: hapus endpoint non-essential
+#   Dihapus : /db-test, /model-info, /predict, /config,
+#             /diagnostics, /reset-rain, /reset-override
+#   Dipertahankan: /, /sensor, /pump-status, /control, /status, /history
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Supabase client (singleton) ───────────────────────────────────────────────
-_supabase: Client = None   # diinisialisasi di startup
+# ── Supabase client ───────────────────────────────────────────────────────────
+_supabase: Client = None
 
 
 def _get_supabase() -> Client:
@@ -66,10 +59,8 @@ def _get_supabase() -> Client:
 
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     if not VALID_API_KEY:
-        log.warning("API_KEY belum di-set di environment variable!")
         return "no-key-configured"
     if api_key != VALID_API_KEY:
-        log.warning("Akses ditolak: API key tidak valid '%s'", api_key)
         raise HTTPException(status_code=401, detail={
             "error"  : "Unauthorized",
             "message": "API key tidak valid atau tidak ada. Sertakan header: X-API-Key: <key>",
@@ -81,11 +72,11 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
 _control_lock      = asyncio.Lock()
 _daily_safety_lock = asyncio.Lock()
 _daily_safety = {
-    "date"                 : None,
-    "watering_count"       : 0,
-    "locked_out"           : False,
+    "date"                  : None,
+    "watering_count"        : 0,
+    "locked_out"            : False,
     "last_pump_duration_sec": 0,
-    "prune_done_today"     : False,
+    "prune_done_today"      : False,
 }
 
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="sb-worker")
@@ -99,8 +90,8 @@ class WateringConfig:
     EVENING_WINDOW = (16, 18)
 
     SOIL_DRY_ON   = 45.0
-    SOIL_WET_OFF  = 70.0
-    CRITICAL_DRY  = 20.0
+    SOIL_WET_OFF  = 65.0
+    CRITICAL_DRY  = 25.0 
 
     RAIN_SCORE_THRESHOLD   = 60
     RAIN_RH_HEAVY          = 92.0
@@ -113,8 +104,8 @@ class WateringConfig:
     RAIN_CONFIRM_READINGS  = 2
     RAIN_CLEAR_READINGS    = 3
 
-    COOLDOWN_MINUTES           = 45
-    POST_RAIN_COOLDOWN_MINUTES = 120
+    COOLDOWN_MINUTES           = 60
+    POST_RAIN_COOLDOWN_MINUTES = 180
     MIN_SESSION_GAP_MINUTES    = 10
 
     MAX_PUMP_DURATION_MINUTES = 5
@@ -141,7 +132,7 @@ CFG = WateringConfig()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Siram Pintar API — Supabase",
+    title="Siram Pintar API",
     description="Sistem Penyiraman Tanaman IoT — KNN + Supabase",
     version=APP_VERSION,
 )
@@ -184,8 +175,7 @@ _STATE_DEFAULTS = {
 }
 
 _rt_cache: dict = {"data": None, "timestamp": 0.0}
-_realtime_socket = None        # placeholder agar /config & /diagnostics tidak error
-_polling_task    = None        # asyncio.Task background polling
+_polling_task   = None
 
 
 def _normalize_state(raw: dict) -> dict:
@@ -201,9 +191,7 @@ def _normalize_state(raw: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # SUPABASE DB HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-
 def _sb_get_state_sync() -> dict:
-    """Baca state dari tabel system_state (row id=1)."""
     try:
         res = _get_supabase().table("system_state").select("*").eq("id", 1).single().execute()
         if res.data:
@@ -214,31 +202,22 @@ def _sb_get_state_sync() -> dict:
 
 
 def _sb_update_state_sync(**kwargs):
-    """
-    Update field di system_state row id=1.
-    Kolom TIMESTAMP di schema PostgreSQL: kirim string ISO-8601 atau None.
-    Kolom DATE (session_count_date): kirim string 'YYYY-MM-DD'.
-    """
     if not kwargs:
         return
     payload = {**kwargs, "id": 1}
     _get_supabase().table("system_state").upsert(payload).execute()
-    log.info("State updated: %s", list(kwargs.keys()))
 
 
 def _sb_insert_sensor_sync(row_data: dict):
-    """Insert satu baris ke tabel sensor_readings."""
     _get_supabase().table("sensor_readings").insert(row_data).execute()
 
 
 def _sb_ensure_state_row():
-    """Pastikan baris id=1 ada di system_state. Schema sudah handle insert via SQL."""
     try:
         res = _get_supabase().table("system_state").select("id").eq("id", 1).execute()
         if not res.data:
-            # Insert minimal — kolom dengan DEFAULT akan terisi otomatis
             _get_supabase().table("system_state").insert({"id": 1}).execute()
-            log.info("system_state row id=1 dibuat di Supabase.")
+            log.info("system_state row id=1 dibuat.")
         else:
             log.info("system_state row id=1 sudah ada.")
     except Exception as e:
@@ -246,13 +225,9 @@ def _sb_ensure_state_row():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BACKGROUND POLLING — 0.5s interval untuk real-time IoT
-# Cache diupdate optimistik langsung saat write (tidak tunggu poll berikutnya).
-# Polling hanya sebagai sync fallback jika ada perubahan dari luar (dashboard, dll).
+# BACKGROUND POLLING
 # ══════════════════════════════════════════════════════════════════════════════
-
 async def _state_polling_loop():
-    """Coroutine background: poll system_state setiap 0.5 detik, update cache."""
     log.info("Background state-polling dimulai (interval 0.5s).")
     while True:
         try:
@@ -261,21 +236,10 @@ async def _state_polling_loop():
             _rt_cache["data"]      = row
             _rt_cache["timestamp"] = time.monotonic()
         except asyncio.CancelledError:
-            log.info("State-polling dihentikan.")
             return
         except Exception as e:
             log.warning("Polling error (akan retry): %s", e)
         await asyncio.sleep(0.5)
-
-
-def _start_supabase_listener():
-    """Kompatibilitas: tidak melakukan apa-apa (polling dimulai di startup)."""
-    pass
-
-
-def _stop_supabase_listener():
-    """Kompatibilitas: tidak melakukan apa-apa (task dibatalkan di shutdown)."""
-    pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,32 +248,24 @@ def _stop_supabase_listener():
 @app.on_event("startup")
 async def startup():
     global _supabase, knn_model, scaler, model_meta
-    log.info("Siram Pintar API v%s (Supabase) starting...", APP_VERSION)
 
     if not SUPABASE_URL or not SUPABASE_KEY:
-        log.error("SUPABASE_URL / SUPABASE_KEY belum di-set di .env!")
-        raise RuntimeError("Supabase credentials missing.")
+        raise RuntimeError("SUPABASE_URL / SUPABASE_KEY belum di-set di .env!")
 
     _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    log.info("Supabase client terhubung: %s", SUPABASE_URL)
-
-    if VALID_API_KEY:
-        log.info("API Key protection: AKTIF (key: %s***)", VALID_API_KEY[:2])
+    log.info("Siram Pintar API v%s — Supabase terhubung.", APP_VERSION)
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(_executor, _sb_ensure_state_row)
 
-    # Mulai background polling (menggantikan Realtime WebSocket)
     global _polling_task
     _polling_task = asyncio.create_task(_state_polling_loop())
-
-    # Beri waktu polling pertama selesai sebelum lanjut
     await asyncio.sleep(2.2)
 
     await _sync_daily_safety_from_db()
 
     if not os.path.exists(MODEL_PATH):
-        log.warning("Model belum ada! Jalankan train_model.py terlebih dahulu.")
+        log.warning("Model KNN belum ada! Jalankan train_model.py.")
         return
     try:
         knn_model = joblib.load(MODEL_PATH)
@@ -381,7 +337,6 @@ def _elapsed_seconds_real(stored_ts_str) -> float:
         return 999_999.0
     try:
         stored = datetime.fromisoformat(str(stored_ts_str))
-        # PostgreSQL bisa kembalikan timezone-aware timestamp; normalisasi ke naive UTC
         if stored.tzinfo is not None:
             stored = stored.replace(tzinfo=None)
         return (datetime.now() - stored).total_seconds()
@@ -398,7 +353,7 @@ def _in_watering_window(hour: int) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER: KNN time encoding
+# HELPER: KNN
 # ══════════════════════════════════════════════════════════════════════════════
 def _encode_hour_cyclic(hour: int) -> tuple:
     angle = 2 * np.pi * hour / 24
@@ -420,13 +375,6 @@ def _get_time_weight(hour: int) -> float:
 # STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 def _get_state(force_fresh: bool = False) -> dict:
-    """
-    Ambil state dari cache.
-    Cache diperbarui oleh:
-      1. Optimistic update langsung saat /sensor atau /control menulis
-      2. Background polling 0.5s sebagai sync fallback
-    TTL 0.1s hanya sebagai guard jika cache belum pernah terisi.
-    """
     if force_fresh:
         row = _sb_get_state_sync()
         _rt_cache["data"]      = row
@@ -439,7 +387,6 @@ def _get_state(force_fresh: bool = False) -> dict:
     if cached and age < 0.1:
         return cached.copy()
 
-    # Cache kosong atau sangat stale → baca langsung
     try:
         row = _sb_get_state_sync()
         _rt_cache["data"]      = row
@@ -451,7 +398,6 @@ def _get_state(force_fresh: bool = False) -> dict:
 
 
 async def _update_state_async(**kwargs):
-    """Update state async. Setelah write, cache di-force-refresh."""
     if not kwargs:
         return
     loop = asyncio.get_event_loop()
@@ -487,12 +433,10 @@ async def _sync_daily_safety_from_db():
             _daily_safety["date"]           = today
             _daily_safety["watering_count"] = db_count
             _daily_safety["locked_out"]     = (db_count >= 10)
-            log.info("_sync_daily_safety: recovered watering_count=%d", db_count)
         else:
             _daily_safety["date"]           = today
             _daily_safety["watering_count"] = 0
             _daily_safety["locked_out"]     = False
-            log.info("_sync_daily_safety: hari baru, counter direset.")
 
 
 def _daily_safety_reset_if_new_day():
@@ -507,14 +451,13 @@ def _daily_safety_reset_if_new_day():
 
 
 def _prune_sensor_readings():
-    """Hapus sensor_readings > 14 hari. Filter pakai kolom TIMESTAMP."""
     try:
         cutoff = (datetime.now() - __import__("datetime").timedelta(days=14)).isoformat()
         _get_supabase().table("sensor_readings")\
             .delete()\
             .lt("timestamp", cutoff)\
             .execute()
-        log.info("Pruned old sensor readings (>14 hari).")
+        log.info("Pruned sensor readings > 14 hari.")
     except Exception as e:
         log.error("Prune error: %s", e)
 
@@ -528,7 +471,7 @@ async def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KNN Classify
+# KNN CLASSIFY
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
     if knn_model is None or scaler is None:
@@ -558,7 +501,7 @@ def classify(soil: float, temp: float, rh: float, hour: int = 12) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAIN DETECTION  (tidak berubah)
+# RAIN DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 def _compute_rain_score(air_humidity, soil_moisture, temperature,
                         last_soil, last_temp, pump_was_on):
@@ -638,7 +581,6 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
             return True
 
     elapsed = _elapsed_seconds_real(state.get("last_sensor_ts"))
-
     if elapsed < CFG.SENSOR_DEBOUNCE_SECONDS:
         if last_soil is None:
             return False
@@ -649,7 +591,7 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SMART WATERING ENGINE  (tidak berubah)
+# SMART WATERING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
                                          air_humidity, temperature, state,
@@ -856,48 +798,22 @@ async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS PUBLIC
+# ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/")
 def root():
+    """Health check."""
     return {
         "status"      : "online",
-        "message"     : "Siram Pintar API berjalan (Supabase)",
         "version"     : APP_VERSION,
         "model_ready" : knn_model is not None,
-        "auth"        : "required" if VALID_API_KEY else "disabled",
-        "database"    : "Supabase PostgreSQL + Realtime",
     }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS PROTECTED
-# ══════════════════════════════════════════════════════════════════════════════
-@app.get("/db-test", dependencies=[Depends(verify_api_key)])
-async def db_test():
-    """Cek koneksi Supabase dengan membaca system_state."""
-    loop = asyncio.get_event_loop()
-    try:
-        state = await loop.run_in_executor(_executor, _sb_get_state_sync)
-        return {
-            "db_status"   : "connected",
-            "supabase_url": SUPABASE_URL,
-            "pump_status" : state["pump_status"],
-            "mode"        : state["mode"],
-        }
-    except Exception as e:
-        return {"db_status": "error", "detail": str(e)}
-
-
-@app.get("/model-info", dependencies=[Depends(verify_api_key)])
-def model_info():
-    if not model_meta:
-        raise HTTPException(status_code=503, detail="Model belum dimuat.")
-    return model_meta
 
 
 @app.post("/sensor", dependencies=[Depends(verify_api_key)])
 async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
+    """Terima data sensor dari ESP32, jalankan KNN, kendalikan pompa otomatis."""
     hour, minute, _day, time_source = _resolve_time_wit(data.hour, data.minute, data.day)
     result    = classify(data.soil_moisture, data.temperature, data.air_humidity, hour=hour)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -955,10 +871,6 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     pending     = smart_eval.get("pending_updates", {})
     all_updates = {**sensor_updates, **pending}
 
-    # ── Optimistic cache update (instan, tanpa tunggu Supabase) ──────────────
-    # Cache diperbarui langsung dengan data yang akan ditulis,
-    # sehingga /pump-status dan polling berikutnya sudah dapat nilai terbaru
-    # bahkan sebelum round-trip ke Supabase selesai.
     optimistic = {**(_rt_cache["data"] or {}), **all_updates}
     _rt_cache["data"]      = _normalize_state(optimistic)
     _rt_cache["timestamp"] = time.monotonic()
@@ -981,23 +893,18 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     }
 
     def _write_state():
-        """Tulis state update ke Supabase — prioritas tinggi."""
         _sb_update_state_sync(**all_updates)
 
     def _write_sensor():
-        """Insert sensor reading — bisa sedikit terlambat, tidak blocking."""
         try:
             _sb_insert_sensor_sync(sensor_row)
         except Exception as e:
             log.error("Sensor insert gagal: %s", e)
 
     try:
-        # Tulis state dulu (kritis untuk pompa), sensor insert paralel di background
-        state_future   = loop.run_in_executor(_executor, _write_state)
-        sensor_future  = loop.run_in_executor(_executor, _write_sensor)
-        # Tunggu state selesai (pompa harus tersimpan), sensor boleh async
+        state_future  = loop.run_in_executor(_executor, _write_state)
+        sensor_future = loop.run_in_executor(_executor, _write_sensor)
         await state_future
-        # Sensor insert jalan di background — tidak blocking response
         asyncio.ensure_future(sensor_future)
     except Exception as e:
         log.error("State write gagal: %s", e)
@@ -1032,8 +939,103 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     }
 
 
+@app.get("/pump-status", dependencies=[Depends(verify_api_key)])
+def get_pump_status():
+    """Polling ringan dari ESP32 setiap 5 detik."""
+    state = _get_state()
+    return {
+        "pump_status"    : state["pump_status"],
+        "mode"           : state["mode"],
+        "manual_override": state.get("manual_override", False),
+    }
+
+
+@app.post("/control", dependencies=[Depends(verify_api_key)])
+async def control_pump(cmd: ControlCommand):
+    """Kontrol pompa manual dari dashboard."""
+    action = (cmd.action or "").lower().strip()
+    if action not in ("on", "off"):
+        raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
+
+    mode = (cmd.mode or "manual").lower().strip()
+    if mode not in ("auto", "manual"):
+        mode = "manual"
+
+    loop = asyncio.get_event_loop()
+
+    async with _control_lock:
+        state   = await loop.run_in_executor(_executor, _sb_get_state_sync)
+        pump_on = action == "on"
+        now_ts  = datetime.now().isoformat()
+
+        pump_changed = state["pump_status"] != pump_on
+        mode_changed = state["mode"] != mode
+
+        if not pump_changed and not mode_changed:
+            return {
+                "success"        : True,
+                "debounced"      : True,
+                "message"        : "Status tidak berubah",
+                "pump_status"    : state["pump_status"],
+                "mode"           : state["mode"],
+                "manual_override": state.get("manual_override", False),
+                "timestamp"      : state.get("last_control_ts") or now_ts,
+            }
+
+        update_kwargs: dict = {"last_control_ts": now_ts}
+
+        if mode_changed:
+            update_kwargs["mode"] = mode
+
+        if pump_changed:
+            update_kwargs["pump_status"] = pump_on
+
+            if not pump_on:
+                current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
+                update_kwargs.update(
+                    pump_start_ts=None,
+                    pump_start_minute=None,
+                    last_watered_ts=now_ts,
+                    last_watered_minute=current_min,
+                    manual_override=True,
+                    manual_override_ts=now_ts,
+                )
+            else:
+                now_utc = datetime.utcnow()
+                h_wit   = (now_utc.hour + 9) % 24
+                update_kwargs.update(
+                    pump_start_ts=now_ts,
+                    pump_start_minute=_total_minutes(h_wit, now_utc.minute),
+                    manual_override=False,
+                    manual_override_ts=None,
+                )
+
+        def _write_only():
+            _sb_update_state_sync(**update_kwargs)
+
+        try:
+            await loop.run_in_executor(_executor, _write_only)
+        except Exception as e:
+            log.error("Control write gagal: %s", e)
+            raise HTTPException(status_code=503, detail="Gagal menyimpan ke Supabase.")
+
+        new_state = _normalize_state({**(_rt_cache["data"] or {}), **update_kwargs})
+        _rt_cache["data"]      = new_state
+        _rt_cache["timestamp"] = time.monotonic()
+
+        return {
+            "success"        : True,
+            "debounced"      : False,
+            "pump_status"    : new_state["pump_status"],
+            "mode"           : new_state["mode"],
+            "manual_override": new_state.get("manual_override", False),
+            "timestamp"      : now_ts,
+        }
+
+
 @app.get("/status", dependencies=[Depends(verify_api_key)])
 async def get_status():
+    """Status sistem lengkap untuk dashboard."""
     state = _get_state()
     loop  = asyncio.get_event_loop()
 
@@ -1083,19 +1085,9 @@ async def get_status():
     }
 
 
-@app.get("/pump-status", dependencies=[Depends(verify_api_key)])
-def get_pump_status():
-    state = _get_state()
-    return {
-        "pump_status"    : state["pump_status"],
-        "mode"           : state["mode"],
-        "manual_override": state.get("manual_override", False),
-        "version"        : APP_VERSION,
-    }
-
-
 @app.get("/history", dependencies=[Depends(verify_api_key)])
 async def get_history(limit: int = Query(default=50, ge=1, le=500)):
+    """Riwayat data sensor untuk grafik dashboard."""
     loop = asyncio.get_event_loop()
 
     def _fetch():
@@ -1109,7 +1101,6 @@ async def get_history(limit: int = Query(default=50, ge=1, le=500)):
                 .execute()
             )
             records = res.data or []
-            # Kembalikan urutan ascending (terlama → terbaru)
             return sorted(records, key=lambda x: x.get("timestamp", ""))
         except Exception as e:
             log.error("History error: %s", e)
@@ -1117,216 +1108,3 @@ async def get_history(limit: int = Query(default=50, ge=1, le=500)):
 
     records = await loop.run_in_executor(_executor, _fetch)
     return {"total": len(records), "records": records}
-
-
-@app.post("/control", dependencies=[Depends(verify_api_key)])
-async def control_pump(cmd: ControlCommand):
-    action = (cmd.action or "").lower().strip()
-    if action not in ("on", "off"):
-        raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
-
-    mode = (cmd.mode or "manual").lower().strip()
-    if mode not in ("auto", "manual"):
-        mode = "manual"
-
-    loop = asyncio.get_event_loop()
-
-    async with _control_lock:
-        state   = await loop.run_in_executor(_executor, _sb_get_state_sync)
-        pump_on = action == "on"
-        now_ts  = datetime.now().isoformat()
-
-        pump_changed = state["pump_status"] != pump_on
-        mode_changed = state["mode"] != mode
-
-        if not pump_changed and not mode_changed:
-            return {
-                "success"        : True,
-                "debounced"      : True,
-                "message"        : "Status tidak berubah",
-                "pump_status"    : state["pump_status"],
-                "mode"           : state["mode"],
-                "manual_override": state.get("manual_override", False),
-                "timestamp"      : state.get("last_control_ts") or now_ts,
-            }
-
-        update_kwargs: dict = {"last_control_ts": now_ts}
-
-        if mode_changed:
-            update_kwargs["mode"] = mode
-            log.info("Mode berubah: %s → %s", state["mode"], mode)
-
-        if pump_changed:
-            update_kwargs["pump_status"] = pump_on
-
-            if not pump_on:
-                current_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
-                update_kwargs.update(
-                    pump_start_ts=None,
-                    pump_start_minute=None,
-                    last_watered_ts=now_ts,
-                    last_watered_minute=current_min,
-                    manual_override=True,
-                    manual_override_ts=now_ts,
-                )
-                log.info("Pompa OFF manual — manual_override diaktifkan.")
-            else:
-                now_utc = datetime.utcnow()
-                h_wit   = (now_utc.hour + 9) % 24
-                update_kwargs.update(
-                    pump_start_ts=now_ts,
-                    pump_start_minute=_total_minutes(h_wit, now_utc.minute),
-                    manual_override=False,
-                    manual_override_ts=None,
-                )
-                log.info("Pompa ON manual.")
-
-        def _write_only():
-            _sb_update_state_sync(**update_kwargs)
-
-        try:
-            await loop.run_in_executor(_executor, _write_only)
-        except Exception as e:
-            log.error("Control write gagal: %s", e)
-            raise HTTPException(status_code=503, detail="Gagal menyimpan ke Supabase.")
-
-        # Optimistic cache update — instan tanpa round-trip baca balik
-        new_state = _normalize_state({**(_rt_cache["data"] or {}), **update_kwargs})
-        _rt_cache["data"]      = new_state
-        _rt_cache["timestamp"] = time.monotonic()
-
-        log.info("Control OK: action=%s mode=%s → pump=%s mode=%s",
-                 action, mode, new_state["pump_status"], new_state["mode"])
-
-        return {
-            "success"        : True,
-            "debounced"      : False,
-            "pump_status"    : new_state["pump_status"],
-            "mode"           : new_state["mode"],
-            "manual_override": new_state.get("manual_override", False),
-            "timestamp"      : now_ts,
-        }
-
-
-@app.post("/predict", dependencies=[Depends(verify_api_key)])
-def predict(data: SensorData):
-    hour, _, _, _ = _resolve_time_wit(data.hour, data.minute, data.day)
-    return {
-        "input" : {
-            "soil_moisture": data.soil_moisture,
-            "temperature"  : data.temperature,
-            "air_humidity" : data.air_humidity,
-            "hour"         : hour,
-        },
-        "result": classify(data.soil_moisture, data.temperature, data.air_humidity, hour=hour),
-    }
-
-
-@app.get("/config", dependencies=[Depends(verify_api_key)])
-def get_config():
-    return {
-        "version"  : APP_VERSION,
-        "database" : "Supabase PostgreSQL + Realtime",
-        "supabase_url": SUPABASE_URL,
-        "watering_windows": {
-            "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59",
-            "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59",
-        },
-        "soil_thresholds": {
-            "dry_on_threshold"  : CFG.SOIL_DRY_ON,
-            "wet_off_threshold" : CFG.SOIL_WET_OFF,
-            "critical_emergency": CFG.CRITICAL_DRY,
-        },
-        "rain_detection": {
-            "score_to_confirm": CFG.RAIN_SCORE_THRESHOLD,
-            "score_to_clear"  : CFG.RAIN_CLEAR_THRESHOLD,
-            "rh_heavy"        : CFG.RAIN_RH_HEAVY,
-            "rh_moderate"     : CFG.RAIN_RH_MODERATE,
-            "rh_light"        : CFG.RAIN_RH_LIGHT,
-        },
-        "pump_control": {
-            "max_duration_min"      : CFG.MAX_PUMP_DURATION_MINUTES,
-            "min_duration_sec"      : CFG.MIN_PUMP_DURATION_SECONDS,
-            "cooldown_normal"       : CFG.COOLDOWN_MINUTES,
-            "cooldown_post_rain"    : CFG.POST_RAIN_COOLDOWN_MINUTES,
-            "manual_override_expire": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
-        },
-        "knn_confidence": {
-            "normal"        : CFG.CONFIDENCE_NORMAL,
-            "hot_weather"   : CFG.CONFIDENCE_HOT,
-            "missed_session": CFG.CONFIDENCE_MISSED,
-            "hot_threshold" : CFG.HOT_TEMP_THRESHOLD,
-        },
-        "time_weights": {
-            "in_window"  : CFG.TIME_WEIGHT_IN_WINDOW,
-            "near_window": CFG.TIME_WEIGHT_NEAR_WINDOW,
-            "outside"    : CFG.TIME_WEIGHT_OUTSIDE,
-        },
-        "realtime": {
-            "listener_active"   : _polling_task is not None and not _polling_task.done(),
-            "cache_ttl_fallback": "0.3s",
-            "sensor_debounce"   : f"{CFG.SENSOR_DEBOUNCE_SECONDS}s",
-            "sensor_tolerance"  : f"{CFG.SENSOR_TOLERANCE}%",
-            "mode"              : "REST polling (2s interval)",
-        },
-    }
-
-
-@app.post("/reset-rain", dependencies=[Depends(verify_api_key)])
-async def reset_rain():
-    await _update_state_async(
-        rain_detected=False, rain_score=0, rain_confirm_count=0,
-        rain_clear_count=0, rain_started_minute=None, missed_session=False,
-    )
-    return {"success": True, "message": "State hujan di-reset."}
-
-
-@app.post("/reset-override", dependencies=[Depends(verify_api_key)])
-async def reset_override():
-    await _update_state_async(manual_override=False, manual_override_ts=None)
-    return {"success": True, "message": "Manual override di-reset. Auto-watering aktif kembali."}
-
-
-@app.get("/diagnostics", dependencies=[Depends(verify_api_key)])
-async def get_diagnostics():
-    state = _get_state(force_fresh=True)
-
-    async with _daily_safety_lock:
-        safety_snapshot = {
-            k: str(v) if isinstance(v, date) else v
-            for k, v in _daily_safety.items()
-        }
-
-    override_remaining = None
-    if state.get("manual_override"):
-        age = _elapsed_seconds_real(state.get("manual_override_ts"))
-        override_remaining = max(0, int(CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - age))
-
-    cache_age = round(time.monotonic() - _rt_cache["timestamp"], 3)
-
-    return {
-        "version"               : APP_VERSION,
-        "server_time_wit"       : datetime.utcnow().strftime("%H:%M:%S") + " (UTC+9=WIT)",
-        "state"                 : {k: str(v) if v is not None else None
-                                   for k, v in state.items()},
-        "daily_safety"          : safety_snapshot,
-        "override_remaining_sec": override_remaining,
-        "knn"                   : {
-            "model_loaded" : knn_model is not None,
-            "scaler_loaded": scaler is not None,
-            "meta"         : model_meta,
-        },
-        "realtime_cache"        : {
-            "listener_active": _polling_task is not None and not _polling_task.done(),
-            "cache_age_sec"  : cache_age,
-            "cache_valid"    : cache_age < 1.0,
-            "mode"           : "REST polling (2s interval)",
-        },
-        "database": {
-            "type"            : "Supabase PostgreSQL",
-            "url"             : SUPABASE_URL,
-            "state_table"     : "system_state",
-            "readings_table"  : "sensor_readings",
-        },
-        "migrations_from": "v8.0.0 (Firebase RT listener) → v9.0.0 (Supabase PostgreSQL + Realtime)",
-    }
