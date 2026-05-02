@@ -38,11 +38,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-APP_VERSION = "9.1.0"
+APP_VERSION = "9.2.0"
 # ═══════════════════════════════════════════════════════════════════════════════
-# v9.1.0 — Production cleanup: hapus endpoint non-essential
-#   Dihapus : /db-test, /model-info, /predict, /config,
-#             /diagnostics, /reset-rain, /reset-override
+# v9.2.0 — Hapus safety lockout harian sepenuhnya
 #   Dipertahankan: /, /sensor, /pump-status, /control, /status, /history
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -74,8 +72,6 @@ _daily_safety_lock = asyncio.Lock()
 _daily_safety = {
     "date"                  : None,
     "watering_count"        : 0,
-    "locked_out"            : False,
-    "last_pump_duration_sec": 0,
     "prune_done_today"      : False,
 }
 
@@ -91,7 +87,7 @@ class WateringConfig:
 
     SOIL_DRY_ON   = 45.0
     SOIL_WET_OFF  = 65.0
-    CRITICAL_DRY  = 25.0 
+    CRITICAL_DRY  = 25.0
 
     RAIN_SCORE_THRESHOLD   = 60
     RAIN_RH_HEAVY          = 92.0
@@ -262,7 +258,7 @@ async def startup():
     _polling_task = asyncio.create_task(_state_polling_loop())
     await asyncio.sleep(2.2)
 
-    await _sync_daily_safety_from_db()
+    await _sync_daily_counter_from_db()
 
     if not os.path.exists(MODEL_PATH):
         log.warning("Model KNN belum ada! Jalankan train_model.py.")
@@ -412,9 +408,9 @@ async def _update_state_async(**kwargs):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DAILY SAFETY
+# DAILY COUNTER (tanpa lockout)
 # ══════════════════════════════════════════════════════════════════════════════
-async def _sync_daily_safety_from_db():
+async def _sync_daily_counter_from_db():
     loop = asyncio.get_event_loop()
     row  = await loop.run_in_executor(_executor, _sb_get_state_sync)
 
@@ -432,19 +428,16 @@ async def _sync_daily_safety_from_db():
         if db_date == today:
             _daily_safety["date"]           = today
             _daily_safety["watering_count"] = db_count
-            _daily_safety["locked_out"]     = (db_count >= 10)
         else:
             _daily_safety["date"]           = today
             _daily_safety["watering_count"] = 0
-            _daily_safety["locked_out"]     = False
 
 
-def _daily_safety_reset_if_new_day():
+def _daily_counter_reset_if_new_day():
     today = date.today()
     if _daily_safety["date"] != today:
         _daily_safety["date"]             = today
         _daily_safety["watering_count"]   = 0
-        _daily_safety["locked_out"]       = False
         _daily_safety["prune_done_today"] = False
         return True
     return False
@@ -464,7 +457,7 @@ def _prune_sensor_readings():
 
 async def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
     async with _daily_safety_lock:
-        _daily_safety_reset_if_new_day()
+        _daily_counter_reset_if_new_day()
         if not _daily_safety["prune_done_today"]:
             _daily_safety["prune_done_today"] = True
             bg_tasks.add_task(_prune_sensor_readings)
@@ -609,13 +602,6 @@ async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
         "pending_updates": {},
     }
 
-    async with _daily_safety_lock:
-        _daily_safety_reset_if_new_day()
-        if _daily_safety["locked_out"]:
-            resp["blocked_reason"] = "Safety Lockout: Melebihi batas harian (10x)."
-            resp["decision_path"].append("SAFETY_LOCKOUT")
-            return resp
-
     if state.get("manual_override"):
         age = _elapsed_seconds_real(state.get("manual_override_ts"))
         if age < CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS:
@@ -663,6 +649,15 @@ async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
     if night_emergency:
         window_label = "malam-darurat"
 
+    # ── Helper tambah sesi (tanpa lockout) ───────────────────────────────────
+    async def _add_pump_on_updates(updates: dict):
+        async with _daily_safety_lock:
+            _daily_counter_reset_if_new_day()
+            _daily_safety["watering_count"] += 1
+            new_count = _daily_safety["watering_count"]
+        updates["session_count_today"] = new_count
+        updates["session_count_date"]  = date.today().isoformat()
+
     # ── Pompa sedang ON ───────────────────────────────────────────────────────
     if state["pump_status"]:
         elapsed_sec = _elapsed_seconds_real(state.get("pump_start_ts"))
@@ -709,16 +704,6 @@ async def _evaluate_smart_watering_async(result, hour, minute, soil_moisture,
         resp["reason"] = f"Running ({elapsed_sec:.0f}s)"
         resp["decision_path"].append("A4-running")
         return resp
-
-    # ── Helper tambah sesi ────────────────────────────────────────────────────
-    async def _add_pump_on_updates(updates: dict):
-        async with _daily_safety_lock:
-            _daily_safety["watering_count"] += 1
-            new_count = _daily_safety["watering_count"]
-            if new_count >= 10:
-                _daily_safety["locked_out"] = True
-        updates["session_count_today"] = new_count
-        updates["session_count_date"]  = date.today().isoformat()
 
     # ── Darurat ───────────────────────────────────────────────────────────────
     if night_emergency or (soil_moisture <= CFG.CRITICAL_DRY and not is_raining):
@@ -1004,7 +989,7 @@ async def control_pump(cmd: ControlCommand):
                 log.info("Pompa OFF manual — manual_override diaktifkan.")
 
             else:
-                # ── Pompa dinyalakan manual ───────────────────────────────
+                # ── Pompa dinyalakan manual (tanpa lockout) ───────────────
                 now_utc = datetime.utcnow()
                 h_wit   = (now_utc.hour + 9) % 24
                 update_kwargs.update(
@@ -1015,19 +1000,9 @@ async def control_pump(cmd: ControlCommand):
                 )
 
                 async with _daily_safety_lock:
-                    _daily_safety_reset_if_new_day()
-
-               
-                    if _daily_safety["locked_out"]:
-                        raise HTTPException(
-                            status_code=429,
-                            detail="Safety lockout: batas penyiraman harian (10x) tercapai."
-                        )
-
+                    _daily_counter_reset_if_new_day()
                     _daily_safety["watering_count"] += 1
                     new_count = _daily_safety["watering_count"]
-                    if new_count >= 10:
-                        _daily_safety["locked_out"] = True
 
                 update_kwargs["session_count_today"] = new_count
                 update_kwargs["session_count_date"]  = date.today().isoformat()
@@ -1087,7 +1062,6 @@ async def get_status():
 
     async with _daily_safety_lock:
         watering_today = _daily_safety["watering_count"]
-        locked_out     = _daily_safety["locked_out"]
 
     return {
         "pump_status"     : state["pump_status"],
@@ -1099,7 +1073,7 @@ async def get_status():
         "missed_session"  : state.get("missed_session", False),
         "manual_override" : state.get("manual_override", False),
         "watering_today"  : watering_today,
-        "safety_locked"   : locked_out,
+        "safety_locked"   : False,  # lockout dihapus, selalu False
         "last_watered_ts" : str(state["last_watered_ts"]) if state.get("last_watered_ts") else None,
         "watering_windows": {
             "morning": f"{CFG.MORNING_WINDOW[0]:02d}:00–{CFG.MORNING_WINDOW[1]:02d}:59 WIT",
@@ -1121,17 +1095,9 @@ async def get_history(
 ):
     """
     Riwayat data sensor untuk grafik dan tabel dashboard.
-
-    Perubahan v9.2.0:
-    - Tambah field `status_tanah` yang diturunkan dari `label`
-      (Kering / Lembab / Basah) agar frontend tidak perlu mapping sendiri.
-    - Tambah query param `pump_only` untuk filter data pompa ON saja,
-      sehingga sesi penyiraman mudah ditelusuri.
-    - Urutan tetap ascending (terlama → terbaru) untuk kebutuhan grafik.
     """
     loop = asyncio.get_event_loop()
 
-    # Mapping label KNN → status tanah yang ditampilkan di dashboard
     LABEL_TO_STATUS = {
         "Kering": "Kering",
         "Lembab": "Lembab",
@@ -1148,19 +1114,16 @@ async def get_history(
                 .limit(limit)
             )
 
-            # [FIX] Filter pompa ON jika diminta frontend
             if pump_only:
                 query = query.eq("pump_status", True)
 
             res     = query.execute()
             records = res.data or []
 
-            # Kembalikan ascending (terlama → terbaru) untuk grafik
             records = sorted(records, key=lambda x: x.get("timestamp", ""))
 
-            # [FIX] Tambah field status_tanah dari label
             for r in records:
-                label           = r.get("label") or ""
+                label             = r.get("label") or ""
                 r["status_tanah"] = LABEL_TO_STATUS.get(label, "-")
 
             return records
