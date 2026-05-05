@@ -11,7 +11,7 @@ from typing import Optional
 import time
 
 from supabase import create_client, Client
-from fastapi import FastAPI, HTTPException, Query, Security, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, Security, Depends, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -37,26 +37,22 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-APP_VERSION = "11.0.0"
+APP_VERSION = "11.0.1-vercel"
 # ═══════════════════════════════════════════════════════════════════════════════
-# v11.0.0 — KNN Super Adaptif (10 Fitur)
-#   Fitur: soil, temp, rh, hour_sin, hour_cos,
-#          rain_score, rain_score_prev, soil_trend, evapotranspiration, is_hot
-#   Label: Siram_Segera, Siram_Prioritas, Siram_Nanti,
-#          Optimal, Basah, Hujan_Aktif, Hujan_Prediksi
-#   KNN adalah satu-satunya pengambil keputusan.
-#   Threshold hanya digunakan sebagai safety guard darurat (soil <= 15%).
+# v11.0.1 — KNN Super Adaptif (10 Fitur) + Vercel Serverless Fix
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _supabase: Client = None
 
-
+# FIX 1: Re-inisialisasi Supabase untuk menangani Cold Start Vercel
 def _get_supabase() -> Client:
     global _supabase
     if _supabase is None:
-        raise RuntimeError("Supabase belum diinisialisasi.")
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("SUPABASE_URL atau SUPABASE_KEY belum di-set!")
+        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        log.info("Supabase client diinisialisasi ulang (Cold Start handling).")
     return _supabase
-
 
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     if not VALID_API_KEY:
@@ -68,7 +64,6 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
         })
     return api_key
 
-
 _control_lock      = asyncio.Lock()
 _daily_safety_lock = asyncio.Lock()
 _daily_safety = {
@@ -78,41 +73,24 @@ _daily_safety = {
 }
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="sb-worker")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # KONFIGURASI
 # ══════════════════════════════════════════════════════════════════════════════
 class WateringConfig:
-    # ── Jam siram aman (WIT = UTC+9, Surabaya/Jawa Timur) ────────────────────
     MORNING_WINDOW = (5, 7)
     EVENING_WINDOW = (16, 18)
-
-    # ── Safety guard HANYA darurat mutlak (bukan penentu utama) ──────────────
-    # Aktif hanya jika soil <= batas ini DAN di luar jam siram DAN tidak hujan
     CRITICAL_DRY = 15.0
-
-    # ── Pompa timing ──────────────────────────────────────────────────────────
     MAX_PUMP_DURATION_MINUTES = 5
     MIN_PUMP_DURATION_SECONDS = 30
     COOLDOWN_MINUTES          = 60
     MIN_SESSION_GAP_MINUTES   = 10
-
-    # ── KNN confidence minimum ────────────────────────────────────────────────
-    # KNN harus cukup yakin sebelum menyalakan pompa
     KNN_CONFIDENCE_MIN          = 50.0
-    KNN_CONFIDENCE_MIN_PRIORITY = 35.0  # lebih longgar untuk Siram_Prioritas
-
-    # ── Label KNN yang berarti "perlu siram" ──────────────────────────────────
+    KNN_CONFIDENCE_MIN_PRIORITY = 35.0 
     NEEDS_WATERING_LABELS = {"Siram_Segera", "Siram_Prioritas"}
-
-    # ── Debounce ──────────────────────────────────────────────────────────────
     SENSOR_DEBOUNCE_SECONDS        = 1
     SENSOR_TOLERANCE               = 0.5
     MANUAL_OVERRIDE_EXPIRE_SECONDS = 600
-
-    # ── Suhu panas (untuk is_hot flag) ────────────────────────────────────────
     HOT_TEMP_THRESHOLD = 34.0
-
 
 CFG = WateringConfig()
 
@@ -129,7 +107,6 @@ knn_model  = None
 scaler     = None
 model_meta: dict = {}
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -142,12 +119,10 @@ _STATE_DEFAULTS = {
     "pump_start_minute"   : None,
     "last_watered_minute" : None,
     "last_watered_ts"     : None,
-    # Sensor history (untuk soil_trend, rain_score_prev)
     "last_soil_moisture"  : None,
     "last_temperature"    : None,
     "last_air_humidity"   : None,
     "last_rain_score"     : None,
-    # Misc
     "missed_session"      : False,
     "manual_override"     : False,
     "manual_override_ts"  : None,
@@ -159,8 +134,6 @@ _STATE_DEFAULTS = {
 }
 
 _rt_cache: dict = {"data": None, "timestamp": 0.0}
-_polling_task   = None
-
 
 def _normalize_state(raw: dict) -> dict:
     row = dict(_STATE_DEFAULTS)
@@ -170,7 +143,6 @@ def _normalize_state(raw: dict) -> dict:
     for k in ("session_count_today",):
         row[k] = int(row.get(k) or 0)
     return row
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SUPABASE HELPERS
@@ -184,16 +156,13 @@ def _sb_get_state_sync() -> dict:
         log.error("Supabase get state: %s", e)
     return dict(_STATE_DEFAULTS)
 
-
 def _sb_update_state_sync(**kwargs):
     if not kwargs:
         return
     _get_supabase().table("system_state").upsert({"id": 1, **kwargs}).execute()
 
-
 def _sb_insert_sensor_sync(row: dict):
     _get_supabase().table("sensor_readings").insert(row).execute()
-
 
 def _sb_ensure_state_row():
     try:
@@ -204,31 +173,12 @@ def _sb_ensure_state_row():
     except Exception as e:
         log.error("Gagal memastikan system_state row: %s", e)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BACKGROUND POLLING
-# ══════════════════════════════════════════════════════════════════════════════
-async def _state_polling_loop():
-    log.info("State-polling dimulai (interval 0.5s).")
-    while True:
-        try:
-            loop = asyncio.get_event_loop()
-            row  = await loop.run_in_executor(_executor, _sb_get_state_sync)
-            _rt_cache["data"]      = row
-            _rt_cache["timestamp"] = time.monotonic()
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            log.warning("Polling error: %s", e)
-        await asyncio.sleep(0.5)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STARTUP / SHUTDOWN
 # ══════════════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
-    global _supabase, knn_model, scaler, model_meta, _polling_task
+    global _supabase, knn_model, scaler, model_meta
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_URL / SUPABASE_KEY belum di-set!")
@@ -238,12 +188,13 @@ async def startup():
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(_executor, _sb_ensure_state_row)
-    _polling_task = asyncio.create_task(_state_polling_loop())
-    await asyncio.sleep(2.2)
+    
+    # Menghapus polling task background karena tidak kompatibel dengan Serverless (Vercel)
+    
     await _sync_daily_counter_from_db()
 
     if not os.path.exists(MODEL_PATH):
-        log.warning("Model KNN belum ada! Jalankan notebook Colab lalu letakkan di folder model/.")
+        log.warning("Model KNN belum ada! Pastikan ditaruh di folder model/.")
         return
     try:
         knn_model = joblib.load(MODEL_PATH)
@@ -262,18 +213,14 @@ async def startup():
     except Exception as exc:
         log.error("Gagal memuat model: %s", exc)
 
-
 @app.on_event("shutdown")
 async def shutdown():
-    global _polling_task
-    if _polling_task and not _polling_task.done():
-        _polling_task.cancel()
-        try:
-            await _polling_task
-        except asyncio.CancelledError:
-            pass
     _executor.shutdown(wait=False)
 
+# FIX 2: Mencegah error 404 Favicon dari Vercel Logs
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEMA
@@ -286,56 +233,36 @@ class SensorData(BaseModel):
     minute        : Optional[int] = Field(default=None, ge=0, le=59)
     day           : Optional[int] = Field(default=None, ge=0, le=6)
 
-
 class ControlCommand(BaseModel):
     action : str           = Field(..., description="'on' atau 'off'")
     mode   : Optional[str] = Field(default="manual")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS — IDENTIK DENGAN NOTEBOOK COLAB
+# HELPER FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 def _encode_hour(hour: int) -> tuple:
-    """Sin-cos encoding jam agar jarak temporal konsisten untuk KNN."""
     rad = hour * 2 * np.pi / 24
     return float(np.sin(rad)), float(np.cos(rad))
 
-
 def _compute_rain_score(rh: float, soil_delta: float, temp_drop: float) -> float:
-    """
-    Hitung skor indikasi hujan (0-100) dari 3 sinyal sensor.
-    IDENTIK dengan fungsi di notebook Colab.
-    rh         : kelembaban udara sekarang (%)
-    soil_delta : kenaikan soil moisture (soil_now - soil_prev)
-    temp_drop  : penurunan suhu (temp_prev - temp_now)
-    """
     score = 0.0
-    # Sinyal RH
     if rh >= 92:
         score += 50
     elif rh >= 85:
         score += 30
     elif rh >= 78:
         score += 15
-    # Sinyal kenaikan tanah mendadak tanpa pompa
     if soil_delta >= 8:
         score += 35
     elif soil_delta >= 3:
         score += 20
-    # Sinyal penurunan suhu
     if temp_drop >= 3:
         score += 15
     return min(score, 100.0)
 
-
 def _compute_evapotranspiration(temp: float, rh: float) -> float:
-    """
-    Estimasi laju penguapan relatif (0-100) — Penman simplified.
-    Semakin panas dan kering → ET tinggi → tanah cepat kering.
-    """
     vpd = (1 - rh / 100) * 0.6108 * np.exp(17.27 * temp / (temp + 237.3))
     return round(float(np.clip(vpd * 15, 0, 100)), 2)
-
 
 def _resolve_time_wit(hour, minute, day) -> tuple:
     if hour is not None and minute is not None and day is not None:
@@ -345,17 +272,14 @@ def _resolve_time_wit(hour, minute, day) -> tuple:
     wday = (now.weekday() + 1) % 7
     return h, now.minute, wday, "server_fallback"
 
-
 def _total_minutes(hour: int, minute: int) -> int:
     return hour * 60 + minute
-
 
 def _elapsed_minutes(current: int, stored) -> int:
     if stored is None:
         return 999_999
     diff = current - int(stored)
     return diff if diff >= 0 else diff + 1440
-
 
 def _elapsed_seconds_real(stored_ts_str) -> float:
     if not stored_ts_str:
@@ -368,14 +292,12 @@ def _elapsed_seconds_real(stored_ts_str) -> float:
     except Exception:
         return 999_999.0
 
-
 def _in_watering_window(hour: int) -> tuple:
     if CFG.MORNING_WINDOW[0] <= hour <= CFG.MORNING_WINDOW[1]:
         return True, "pagi"
     if CFG.EVENING_WINDOW[0] <= hour <= CFG.EVENING_WINDOW[1]:
         return True, "sore"
     return False, ""
-
 
 def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool:
     if data.soil_moisture <= 0.0 or data.temperature <= 0.0 or data.temperature >= 60.0:
@@ -393,9 +315,8 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
             return True
     return False
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# CLASSIFY — Inti sistem, 10 fitur, identik dengan Colab
+# CLASSIFY
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(
     soil: float, temp: float, rh: float, hour: int,
@@ -404,35 +325,16 @@ def classify(
     rh_prev:   Optional[float] = None,
     rain_score_prev: Optional[float] = None,
 ) -> dict:
-    """
-    Klasifikasi kondisi tanah menggunakan KNN Super Adaptif (10 fitur).
-
-    Fitur yang dikirim ke KNN (urutan WAJIB sama dengan training):
-      1. soil_moisture
-      2. temperature
-      3. air_humidity
-      4. hour_sin
-      5. hour_cos
-      6. rain_score
-      7. rain_score_prev
-      8. soil_trend
-      9. evapotranspiration
-     10. is_hot
-
-    Label output: Siram_Segera, Siram_Prioritas, Siram_Nanti,
-                  Optimal, Basah, Hujan_Aktif, Hujan_Prediksi
-    """
     if knn_model is None or scaler is None:
         raise HTTPException(status_code=503, detail="Model KNN belum dimuat.")
 
     try:
-        # Hitung fitur turunan
         _soil_prev = soil_prev if soil_prev is not None else soil
         _temp_prev = temp_prev if temp_prev is not None else temp
         _rh_prev   = rh_prev   if rh_prev   is not None else rh
 
-        soil_delta  = soil - _soil_prev       # tren kelembaban tanah
-        temp_drop   = _temp_prev - temp       # penurunan suhu
+        soil_delta  = soil - _soil_prev       
+        temp_drop   = _temp_prev - temp       
         soil_trend  = soil_delta
 
         rain_score  = _compute_rain_score(rh, soil_delta, temp_drop)
@@ -445,7 +347,6 @@ def classify(
         is_hot      = 1 if temp >= CFG.HOT_TEMP_THRESHOLD else 0
         hour_sin, hour_cos = _encode_hour(hour)
 
-        # Vektor fitur — urutan WAJIB sama dengan training Colab
         X = np.array([[
             soil, temp, rh,
             hour_sin, hour_cos,
@@ -487,20 +388,24 @@ def classify(
         log.error("KNN classify error: %s", e)
         raise HTTPException(status_code=503, detail=f"Model inference error: {e}")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
+# FIX 3: Fetch-on-Demand State Retrieval (Menggantikan Polling)
 def _get_state(force_fresh: bool = False) -> dict:
     if force_fresh:
         row = _sb_get_state_sync()
         _rt_cache["data"]      = row
         _rt_cache["timestamp"] = time.monotonic()
         return row
+        
     cached = _rt_cache["data"]
-    age    = time.monotonic() - _rt_cache["timestamp"]
-    if cached and age < 0.1:
+    age    = time.monotonic() - _rt_cache.get("timestamp", 0)
+    
+    # TTL Cache 2 detik agar tidak terlalu sering tembak DB jika request berdekatan
+    if cached and age < 2.0:
         return cached.copy()
+        
     try:
         row = _sb_get_state_sync()
         _rt_cache["data"]      = row
@@ -509,7 +414,6 @@ def _get_state(force_fresh: bool = False) -> dict:
     except Exception as e:
         log.error("Fallback get state: %s", e)
         return cached.copy() if cached else dict(_STATE_DEFAULTS)
-
 
 async def _update_state_async(**kwargs):
     if not kwargs:
@@ -523,7 +427,6 @@ async def _update_state_async(**kwargs):
         _rt_cache["timestamp"] = time.monotonic()
 
     await loop.run_in_executor(_executor, _do)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DAILY COUNTER
@@ -548,7 +451,6 @@ async def _sync_daily_counter_from_db():
             _daily_safety["date"]           = today
             _daily_safety["watering_count"] = 0
 
-
 def _daily_counter_reset_if_new_day():
     today = date.today()
     if _daily_safety["date"] != today:
@@ -557,7 +459,6 @@ def _daily_counter_reset_if_new_day():
         _daily_safety["prune_done_today"] = False
         return True
     return False
-
 
 def _prune_sensor_readings():
     try:
@@ -568,7 +469,6 @@ def _prune_sensor_readings():
     except Exception as e:
         log.error("Prune error: %s", e)
 
-
 async def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
     async with _daily_safety_lock:
         _daily_counter_reset_if_new_day()
@@ -576,27 +476,8 @@ async def _maybe_schedule_prune(bg_tasks: BackgroundTasks):
             _daily_safety["prune_done_today"] = True
             bg_tasks.add_task(_prune_sensor_readings)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SMART WATERING ENGINE — Berbasis KNN Super Adaptif
-#
-# Alur keputusan (KNN adalah pengambil keputusan utama):
-#
-#   POMPA SEDANG ON:
-#     A1. Durasi maksimum → OFF
-#     A2. KNN tidak lagi needs_watering → OFF
-#     A3. KNN = Hujan_Aktif/Hujan_Prediksi → OFF
-#     A4. Warmup → biarkan jalan
-#
-#   POMPA OFF:
-#     B1. Manual override aktif → BLOKIR
-#     B2. Darurat mutlak (soil <= 15%, luar jadwal, tidak hujan) → SIRAM DARURAT
-#     B3. KNN = needs_watering=True → lanjut ke B4
-#        B3-TIDAK → BLOKIR (KNN bilang tidak perlu siram)
-#     B4. KNN confidence cukup → lanjut ke B5
-#        B4-TIDAK → BLOKIR (KNN tidak cukup yakin)
-#     B5. Cooldown selesai → POMPA ON
-#        B5-TIDAK → BLOKIR (masih cooldown)
+# SMART WATERING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 async def _evaluate_smart_watering_async(
     knn_result, hour, minute,
@@ -615,7 +496,6 @@ async def _evaluate_smart_watering_async(
         "pending_updates"  : {},
     }
 
-    # ── B1. Cek manual override ───────────────────────────────────────────────
     if state.get("manual_override"):
         age = _elapsed_seconds_real(state.get("manual_override_ts"))
         if age < CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS:
@@ -626,7 +506,6 @@ async def _evaluate_smart_watering_async(
         else:
             resp["pending_updates"].update(manual_override=False, manual_override_ts=None)
 
-    # ── Helper: catat sesi siram ──────────────────────────────────────────────
     async def _add_pump_on_updates(upd: dict):
         async with _daily_safety_lock:
             _daily_counter_reset_if_new_day()
@@ -635,12 +514,10 @@ async def _evaluate_smart_watering_async(
         upd["session_count_today"] = cnt
         upd["session_count_date"]  = date.today().isoformat()
 
-    # ── POMPA SEDANG ON ───────────────────────────────────────────────────────
     if state["pump_status"]:
         elapsed_sec = _elapsed_seconds_real(state.get("pump_start_ts"))
         max_sec     = CFG.MAX_PUMP_DURATION_MINUTES * 60
 
-        # A1. Durasi maksimum
         if elapsed_sec >= max_sec:
             resp["pending_updates"].update(
                 pump_status=False,
@@ -653,13 +530,11 @@ async def _evaluate_smart_watering_async(
             resp["decision_path"].append("A1-max-duration")
             return resp
 
-        # Warmup
         if elapsed_sec < CFG.MIN_PUMP_DURATION_SECONDS:
             resp["reason"] = f"Warmup ({elapsed_sec:.0f}s)"
             resp["decision_path"].append("A-warmup")
             return resp
 
-        # A2. KNN bilang tanah sudah tidak perlu disiram
         if not knn_result["needs_watering"]:
             resp["pending_updates"].update(
                 pump_status=False,
@@ -675,7 +550,6 @@ async def _evaluate_smart_watering_async(
             resp["decision_path"].append("A2-knn-off")
             return resp
 
-        # A3. Hujan terdeteksi → matikan pompa
         if knn_result["label"] in ("Hujan_Aktif", "Hujan_Prediksi"):
             resp["pending_updates"].update(
                 pump_status=False,
@@ -690,7 +564,6 @@ async def _evaluate_smart_watering_async(
             resp["decision_path"].append("A3-rain-off")
             return resp
 
-        # A4. Pompa jalan, KNN masih perlu siram
         resp["reason"] = (
             f"KNN: {knn_result['label']} ({knn_result['confidence']}%) — "
             f"pompa jalan ({elapsed_sec:.0f}s)"
@@ -698,11 +571,8 @@ async def _evaluate_smart_watering_async(
         resp["decision_path"].append("A4-running")
         return resp
 
-    # ── POMPA OFF — Evaluasi apakah perlu dinyalakan ──────────────────────────
-
     in_window, window_label = _in_watering_window(hour)
 
-    # B2. Darurat mutlak (safety guard, BUKAN pengambil keputusan utama)
     night_emergency = (
         not in_window
         and soil_moisture <= CFG.CRITICAL_DRY
@@ -725,7 +595,6 @@ async def _evaluate_smart_watering_async(
         resp["decision_path"].append("B2-emergency")
         return resp
 
-    # B3. KNN sebagai pengambil keputusan utama
     if not knn_result["needs_watering"]:
         resp["blocked_reason"] = (
             f"KNN: {knn_result['label']} ({knn_result['confidence']}%) — tidak perlu siram"
@@ -733,7 +602,6 @@ async def _evaluate_smart_watering_async(
         resp["decision_path"].append("B3-knn-no-water")
         return resp
 
-    # B4. Confidence KNN harus cukup
     min_conf = (
         CFG.KNN_CONFIDENCE_MIN_PRIORITY
         if knn_result["label"] == "Siram_Prioritas"
@@ -747,7 +615,6 @@ async def _evaluate_smart_watering_async(
         resp["decision_path"].append("B4-low-confidence")
         return resp
 
-    # B5. Cooldown antar sesi
     elapsed_cd = _elapsed_minutes(current_total_minutes, state.get("last_watered_minute"))
     if elapsed_cd < CFG.COOLDOWN_MINUTES:
         resp["blocked_reason"] = (
@@ -756,7 +623,6 @@ async def _evaluate_smart_watering_async(
         resp["decision_path"].append("B5-cooldown")
         return resp
 
-    # ✅ Semua kondisi terpenuhi — KNN memutuskan SIRAM
     now_ts = datetime.now().isoformat()
     pump_u = dict(
         pump_status=True,
@@ -775,7 +641,6 @@ async def _evaluate_smart_watering_async(
     )
     resp["decision_path"].append("B6-knn-final")
     return resp
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
@@ -797,18 +662,8 @@ def root():
         } if model_meta else None,
     }
 
-
 @app.post("/sensor", dependencies=[Depends(verify_api_key)])
 async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
-    """
-    Terima data sensor dari ESP32.
-
-    Alur:
-      1. Ambil state sebelumnya untuk hitung soil_trend & rain_score_prev
-      2. KNN (10 fitur) mengklasifikasikan kondisi
-      3. Smart watering engine menggunakan keputusan KNN
-      4. Simpan ke Supabase
-    """
     hour, minute, _day, time_source = _resolve_time_wit(data.hour, data.minute, data.day)
     timestamp         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row_id            = str(uuid.uuid4())
@@ -820,7 +675,6 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     if _should_skip_sensor(data, state, pump_is_on):
         elapsed_spam = _elapsed_seconds_real(state.get("last_sensor_ts"))
         if elapsed_spam < 1.0:
-            # Kembalikan state terakhir tanpa proses ulang
             return {
                 "received"      : True,
                 "timestamp"     : state.get("last_updated") or timestamp,
@@ -841,7 +695,6 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
 
     await _maybe_schedule_prune(bg_tasks)
 
-    # ── Langkah 1: KNN classify (10 fitur) ───────────────────────────────────
     knn_result = classify(
         soil      = data.soil_moisture,
         temp      = data.temperature,
@@ -853,7 +706,6 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         rain_score_prev = state.get("last_rain_score"),
     )
 
-    # ── Langkah 2: Smart watering engine ─────────────────────────────────────
     final_action = None
     smart_eval   = {}
 
@@ -870,7 +722,6 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         (final_action == "on") if final_action is not None else state["pump_status"]
     )
 
-    # ── Langkah 3: Simpan state & sensor ─────────────────────────────────────
     sensor_updates = dict(
         last_label          = knn_result["label"],
         last_updated        = timestamp,
@@ -884,7 +735,6 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
     pending     = smart_eval.get("pending_updates", {})
     all_updates = {**sensor_updates, **pending}
 
-    # Optimistic cache update
     optimistic = {**(_rt_cache["data"] or {}), **all_updates}
     _rt_cache["data"]      = _normalize_state(optimistic)
     _rt_cache["timestamp"] = time.monotonic()
@@ -952,10 +802,8 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         } if state["mode"] == "auto" else None,
     }
 
-
 @app.get("/pump-status", dependencies=[Depends(verify_api_key)])
 def get_pump_status():
-    """Polling ringan dari ESP32."""
     state = _get_state()
     return {
         "pump_status"    : state["pump_status"],
@@ -963,10 +811,8 @@ def get_pump_status():
         "manual_override": state.get("manual_override", False),
     }
 
-
 @app.post("/control", dependencies=[Depends(verify_api_key)])
 async def control_pump(cmd: ControlCommand):
-    """Kontrol manual pompa dari dashboard."""
     action = (cmd.action or "").lower().strip()
     if action not in ("on", "off"):
         raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
@@ -1038,10 +884,8 @@ async def control_pump(cmd: ControlCommand):
             "timestamp"      : now_ts,
         }
 
-
 @app.get("/status", dependencies=[Depends(verify_api_key)])
 async def get_status():
-    """Status sistem lengkap untuk dashboard."""
     state = _get_state()
     loop  = asyncio.get_event_loop()
 
@@ -1101,13 +945,11 @@ async def get_status():
         "latest_data": latest,
     }
 
-
 @app.get("/history", dependencies=[Depends(verify_api_key)])
 async def get_history(
     limit     : int  = Query(default=50, ge=1, le=500),
     pump_only : bool = Query(default=False),
 ):
-    """Riwayat sensor untuk grafik dashboard."""
     loop = asyncio.get_event_loop()
 
     def _fetch():
