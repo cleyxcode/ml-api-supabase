@@ -19,31 +19,35 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("siram-pintar")
 
-# ── Path ──────────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH  = os.path.join(BASE_DIR, "model", "knn_model.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "model", "scaler.pkl")
 META_PATH   = os.path.join(BASE_DIR, "model", "model_info.json")
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-# ── API Key ───────────────────────────────────────────────────────────────────
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-APP_VERSION = "11.1.0"
+APP_VERSION = "11.2.0"
 # ═══════════════════════════════════════════════════════════════════════════════
-# v11.1.0 — KNN Super Adaptif (10 Fitur) + Endpoint /test-knn untuk Postman
-#   Baru: /test-knn          → uji KNN murni (tanpa Supabase, tanpa pompa)
-#   Baru: /test-knn/batch    → uji banyak skenario sekaligus
-#   Baru: /test-knn/skenario → ambil 12 skenario preset siap pakai
-#   Baru: /test-knn/reset    → reset state cooldown untuk pengujian ulang
+# v11.2.0 — Fix OVR loop bug + OVR timeout diubah ke 3 menit (180 detik)
+#
+# ROOT CAUSE BUG OVR LOOP:
+#   Di _evaluate_smart_watering_async, ketika OVR aktif dan masih dalam batas
+#   waktu, fungsi langsung return dengan pending_updates = {} (kosong).
+#   Lalu di /sensor, all_updates = {sensor_updates} tanpa manual_override.
+#   Saat Supabase di-upsert, field manual_override tidak disertakan →
+#   Supabase mengeset manual_override=False (default upsert behavior).
+#   Polling berikutnya baca False → ESP32 reset OVR → looping terus.
+#
+# FIX:
+#   Tambahkan manual_override=True ke pending_updates setiap kali OVR
+#   masih aktif, sehingga nilai True selalu di-persist ke Supabase.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _supabase: Client = None
@@ -96,10 +100,13 @@ class WateringConfig:
     KNN_CONFIDENCE_MIN_PRIORITY = 35.0
     NEEDS_WATERING_LABELS       = {"Siram_Segera", "Siram_Prioritas"}
 
-    SENSOR_DEBOUNCE_SECONDS        = 1
-    SENSOR_TOLERANCE               = 0.5
-    MANUAL_OVERRIDE_EXPIRE_SECONDS = 600
-    HOT_TEMP_THRESHOLD             = 34.0
+    SENSOR_DEBOUNCE_SECONDS = 1
+    SENSOR_TOLERANCE        = 0.5
+
+    # ── [CHANGED] OVR timeout diubah dari 600s → 180s (3 menit) ──────────────
+    MANUAL_OVERRIDE_EXPIRE_SECONDS = 180
+
+    HOT_TEMP_THRESHOLD = 34.0
 
 
 CFG = WateringConfig()
@@ -107,12 +114,12 @@ CFG = WateringConfig()
 app = FastAPI(
     title="Siram Pintar API",
     description=(
-        "Sistem Penyiraman IoT — KNN Super Adaptif 10 Fitur\n\n"
+        "Sistem Penyiraman IoT — KNN Super Adaptif 10 Fitur v11.2\n\n"
         "### Endpoint Pengujian (Postman)\n"
         "- `POST /test-knn` — Uji KNN dengan data sensor bebas\n"
         "- `POST /test-knn/batch` — Uji banyak skenario sekaligus\n"
         "- `GET  /test-knn/skenario` — Ambil 12 skenario preset\n"
-        "- `POST /test-knn/reset` — Reset state cooldown untuk pengujian ulang\n"
+        "- `POST /test-knn/reset` — Reset state cooldown\n"
     ),
     version=APP_VERSION,
 )
@@ -207,7 +214,8 @@ async def startup():
         raise RuntimeError("SUPABASE_URL / SUPABASE_KEY belum di-set!")
 
     _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    log.info("Siram Pintar API v%s dimulai.", APP_VERSION)
+    log.info("Siram Pintar API v%s dimulai. OVR timeout=%ds",
+             APP_VERSION, CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS)
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(_executor, _sb_ensure_state_row)
@@ -222,12 +230,10 @@ async def startup():
         if os.path.exists(META_PATH):
             with open(META_PATH) as f:
                 model_meta = json.load(f)
-        log.info(
-            "Model KNN v%s dimuat. K=%s, Akurasi=%.2f%%",
-            model_meta.get("version", "?"),
-            model_meta.get("best_k"),
-            float(model_meta.get("accuracy", 0)) * 100,
-        )
+        log.info("Model KNN v%s dimuat. K=%s, Akurasi=%.2f%%",
+                 model_meta.get("version", "?"),
+                 model_meta.get("best_k"),
+                 float(model_meta.get("accuracy", 0)) * 100)
     except Exception as exc:
         log.error("Gagal memuat model: %s", exc)
 
@@ -246,10 +252,10 @@ async def favicon():
 # SCHEMA
 # ══════════════════════════════════════════════════════════════════════════════
 class SensorData(BaseModel):
-    soil_moisture : float = Field(..., ge=0, le=100, description="Kelembaban tanah 0-100%")
-    temperature   : float = Field(..., ge=0, le=60,  description="Suhu udara 0-60°C")
-    air_humidity  : float = Field(..., ge=0, le=100, description="Kelembaban udara 0-100%")
-    hour          : Optional[int] = Field(default=None, ge=0, le=23, description="Jam WIT dari RTC ESP32")
+    soil_moisture : float = Field(..., ge=0, le=100)
+    temperature   : float = Field(..., ge=0, le=60)
+    air_humidity  : float = Field(..., ge=0, le=100)
+    hour          : Optional[int] = Field(default=None, ge=0, le=23)
     minute        : Optional[int] = Field(default=None, ge=0, le=59)
     day           : Optional[int] = Field(default=None, ge=0, le=6)
 
@@ -259,91 +265,42 @@ class ControlCommand(BaseModel):
     mode   : Optional[str] = Field(default="manual")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SCHEMA KHUSUS ENDPOINT TEST
-# ══════════════════════════════════════════════════════════════════════════════
 class TestKNNRequest(BaseModel):
-    """
-    Request body untuk endpoint /test-knn.
-    Kamu bisa isi semua field atau hanya 3 field utama.
-    Field soil_prev, temp_prev, rh_prev adalah nilai pembacaan SEBELUMNYA
-    (untuk menghitung tren dan rain_score).
-    """
-    soil_moisture : float = Field(..., ge=0,  le=100, description="Kelembaban tanah sekarang (%)")
-    temperature   : float = Field(..., ge=0,  le=60,  description="Suhu udara sekarang (°C)")
-    air_humidity  : float = Field(..., ge=0,  le=100, description="Kelembaban udara sekarang (%)")
-    hour          : int   = Field(..., ge=0,  le=23,  description="Jam saat ini (WIT, 0-23)")
-
-    # Nilai sebelumnya — opsional, untuk hitung soil_trend & rain_score_prev
-    soil_prev     : Optional[float] = Field(default=None, ge=0, le=100,
-                                             description="Kelembaban tanah pembacaan sebelumnya (%)")
-    temp_prev     : Optional[float] = Field(default=None, ge=0, le=60,
-                                             description="Suhu pembacaan sebelumnya (°C)")
-    rh_prev       : Optional[float] = Field(default=None, ge=0, le=100,
-                                             description="Kelembaban udara pembacaan sebelumnya (%)")
-
-    # Metadata opsional
-    label_skenario: Optional[str]   = Field(default=None, description="Nama/label skenario pengujian")
-    ekspektasi    : Optional[str]   = Field(default=None,
-                                             description="Hasil yang kamu harapkan (Siram_Segera/Optimal/dll)")
-
-    class Config:
-        json_schema_extra = {
-            "examples": {
-                "Pagi hari tanah kering": {
-                    "value": {
-                        "soil_moisture": 22.0,
-                        "temperature"  : 29.0,
-                        "air_humidity" : 55.0,
-                        "hour"         : 6,
-                        "soil_prev"    : 24.0,
-                        "temp_prev"    : 29.0,
-                        "rh_prev"      : 54.0,
-                        "label_skenario": "S01 - Pagi kering",
-                        "ekspektasi"   : "Siram_Segera"
-                    }
-                }
-            }
-        }
+    soil_moisture  : float          = Field(..., ge=0,  le=100)
+    temperature    : float          = Field(..., ge=0,  le=60)
+    air_humidity   : float          = Field(..., ge=0,  le=100)
+    hour           : int            = Field(..., ge=0,  le=23)
+    soil_prev      : Optional[float]= Field(default=None, ge=0, le=100)
+    temp_prev      : Optional[float]= Field(default=None, ge=0, le=60)
+    rh_prev        : Optional[float]= Field(default=None, ge=0, le=100)
+    label_skenario : Optional[str]  = Field(default=None)
+    ekspektasi     : Optional[str]  = Field(default=None)
 
 
 class TestKNNBatchRequest(BaseModel):
-    """Request body untuk /test-knn/batch — uji banyak skenario sekaligus."""
-    skenario: List[TestKNNRequest] = Field(
-        ..., min_length=1, max_length=50,
-        description="Daftar skenario (maks 50 sekaligus)"
-    )
+    skenario: List[TestKNNRequest] = Field(..., min_length=1, max_length=50)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 def _encode_hour(hour: int) -> tuple:
-    """Sin-cos encoding jam agar KNN tahu kedekatan waktu (23:00 dekat 00:00)."""
     rad = hour * 2 * np.pi / 24
     return float(np.sin(rad)), float(np.cos(rad))
 
 
 def _compute_rain_score(rh: float, soil_delta: float, temp_drop: float) -> float:
-    """
-    Skor hujan komposit (0-100) dari 3 sinyal sensor.
-    Identik dengan fungsi di notebook Colab.
-    """
     score = 0.0
     if   rh >= 92: score += 50
     elif rh >= 85: score += 30
     elif rh >= 78: score += 15
-
     if   soil_delta >= 8: score += 35
     elif soil_delta >= 3: score += 20
-
     if temp_drop >= 3: score += 15
-
     return min(score, 100.0)
 
 
 def _compute_evapotranspiration(temp: float, rh: float) -> float:
-    """Estimasi laju penguapan (0-100) — Penman simplified."""
     vpd = (1 - rh / 100) * 0.6108 * np.exp(17.27 * temp / (temp + 237.3))
     return round(float(np.clip(vpd * 15, 0, 100)), 2)
 
@@ -404,7 +361,7 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLASSIFY — Inti KNN, 10 fitur
+# CLASSIFY
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(
     soil: float, temp: float, rh: float, hour: int,
@@ -413,15 +370,8 @@ def classify(
     rh_prev         : Optional[float] = None,
     rain_score_prev : Optional[float] = None,
 ) -> dict:
-    """
-    Klasifikasi KNN dengan 10 fitur adaptif.
-    Urutan fitur WAJIB sama dengan training di Colab:
-      [soil, temp, rh, hour_sin, hour_cos,
-       rain_score, rain_score_prev, soil_trend, et, is_hot]
-    """
     if knn_model is None or scaler is None:
-        raise HTTPException(status_code=503, detail="Model KNN belum dimuat. Jalankan training Colab dulu.")
-
+        raise HTTPException(status_code=503, detail="Model KNN belum dimuat.")
     try:
         _soil_prev = soil_prev if soil_prev is not None else soil
         _temp_prev = temp_prev if temp_prev is not None else temp
@@ -432,16 +382,12 @@ def classify(
         soil_trend = soil_delta
 
         rain_score = _compute_rain_score(rh, soil_delta, temp_drop)
-        _rs_prev   = (
-            rain_score_prev
-            if rain_score_prev is not None
-            else _compute_rain_score(_rh_prev, 0.0, 0.0)
-        )
+        _rs_prev   = (rain_score_prev if rain_score_prev is not None
+                      else _compute_rain_score(_rh_prev, 0.0, 0.0))
         et         = _compute_evapotranspiration(temp, rh)
         is_hot     = 1 if temp >= CFG.HOT_TEMP_THRESHOLD else 0
         hour_sin, hour_cos = _encode_hour(hour)
 
-        # Vektor fitur — URUTAN SAMA DENGAN TRAINING
         X        = np.array([[soil, temp, rh, hour_sin, hour_cos,
                                rain_score, _rs_prev, soil_trend, et, is_hot]])
         X_scaled = scaler.transform(X)
@@ -460,12 +406,12 @@ def classify(
             "description"       : model_meta.get("label_desc", {}).get(label, ""),
             "computed_features" : {
                 "rain_score"        : round(rain_score, 2),
-                "rain_score_prev"   : round(_rs_prev,   2),
+                "rain_score_prev"   : round(_rs_prev, 2),
                 "soil_trend"        : round(soil_trend, 2),
                 "evapotranspiration": et,
                 "is_hot"            : is_hot,
-                "hour_sin"          : round(hour_sin,   4),
-                "hour_cos"          : round(hour_cos,   4),
+                "hour_sin"          : round(hour_sin, 4),
+                "hour_cos"          : round(hour_cos, 4),
             },
             "k"     : model_meta.get("best_k", knn_model.n_neighbors),
             "metric": model_meta.get("metric", "euclidean"),
@@ -498,18 +444,6 @@ def _get_state(force_fresh: bool = False) -> dict:
     except Exception as e:
         log.error("Fallback get state: %s", e)
         return cached.copy() if cached else dict(_STATE_DEFAULTS)
-
-
-async def _update_state_async(**kwargs):
-    if not kwargs:
-        return
-    loop = asyncio.get_event_loop()
-    def _do():
-        _sb_update_state_sync(**kwargs)
-        fresh = _sb_get_state_sync()
-        _rt_cache["data"]      = fresh
-        _rt_cache["timestamp"] = time.monotonic()
-    await loop.run_in_executor(_executor, _do)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -583,16 +517,48 @@ async def _evaluate_smart_watering_async(
         "pending_updates"  : {},
     }
 
-    # B1. Manual override
+    # ══════════════════════════════════════════════════════════════════════════
+    # B1. Manual Override
+    #
+    # [FIX v11.2.0] BUG LAMA:
+    #   Ketika OVR masih aktif (age < expire), fungsi return langsung dengan
+    #   pending_updates = {} (kosong). Lalu di /sensor, all_updates hanya
+    #   berisi sensor_updates tanpa manual_override. Saat Supabase di-upsert,
+    #   field manual_override tidak ada di payload → Supabase mengeset ke
+    #   nilai default False → OVR ter-reset setiap 30 detik → looping.
+    #
+    # FIX:
+    #   Selalu sertakan manual_override=True dan manual_override_ts ke dalam
+    #   pending_updates selama OVR masih aktif, sehingga nilai True selalu
+    #   di-persist ke Supabase di setiap request /sensor.
+    # ══════════════════════════════════════════════════════════════════════════
     if state.get("manual_override"):
         age = _elapsed_seconds_real(state.get("manual_override_ts"))
+
         if age < CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS:
+            # OVR masih aktif — BLOKIR dan PERSIST agar tidak ter-reset
             remaining = int(CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - age)
-            resp["blocked_reason"] = f"Manual override aktif ({remaining}s lagi)"
+            resp["blocked_reason"] = (
+                f"Manual override aktif ({remaining}s lagi / "
+                f"{remaining // 60}m{remaining % 60:02d}s)"
+            )
             resp["decision_path"].append("B1-manual-override")
+
+            # [FIX] Selalu tulis ulang manual_override=True ke Supabase
+            # agar tidak ter-overwrite oleh upsert sensor_updates
+            resp["pending_updates"].update(
+                manual_override    = True,
+                manual_override_ts = state.get("manual_override_ts"),  # jangan ubah timestamp
+            )
             return resp
+
         else:
-            resp["pending_updates"].update(manual_override=False, manual_override_ts=None)
+            # OVR sudah expired — reset
+            log.info("[OVR] Expired setelah %ds — reset otomatis.", int(age))
+            resp["pending_updates"].update(
+                manual_override    = False,
+                manual_override_ts = None,
+            )
 
     async def _add_pump_on_updates(upd: dict):
         async with _daily_safety_lock:
@@ -656,7 +622,9 @@ async def _evaluate_smart_watering_async(
     if (not in_window and soil_moisture <= CFG.CRITICAL_DRY
             and knn_result["label"] not in ("Hujan_Aktif", "Hujan_Prediksi")):
         now_ts = datetime.now().isoformat()
-        pump_u = dict(pump_status=True, pump_start_minute=current_total_minutes, pump_start_ts=now_ts)
+        pump_u = dict(pump_status=True,
+                      pump_start_minute=current_total_minutes,
+                      pump_start_ts=now_ts)
         await _add_pump_on_updates(pump_u)
         resp["pending_updates"].update(pump_u)
         resp["action"] = "on"
@@ -666,7 +634,9 @@ async def _evaluate_smart_watering_async(
 
     # B3. KNN utama
     if not knn_result["needs_watering"]:
-        resp["blocked_reason"] = f"KNN: {knn_result['label']} ({knn_result['confidence']}%) — tidak perlu siram"
+        resp["blocked_reason"] = (
+            f"KNN: {knn_result['label']} ({knn_result['confidence']}%) — tidak perlu siram"
+        )
         resp["decision_path"].append("B3-knn-no-water")
         return resp
 
@@ -675,20 +645,26 @@ async def _evaluate_smart_watering_async(
                 if knn_result["label"] == "Siram_Prioritas"
                 else CFG.KNN_CONFIDENCE_MIN)
     if knn_result["confidence"] < min_conf:
-        resp["blocked_reason"] = f"KNN confidence {knn_result['confidence']}% < minimum {min_conf:.0f}%"
+        resp["blocked_reason"] = (
+            f"KNN confidence {knn_result['confidence']}% < minimum {min_conf:.0f}%"
+        )
         resp["decision_path"].append("B4-low-confidence")
         return resp
 
     # B5. Cooldown
     elapsed_cd = _elapsed_minutes(current_total_minutes, state.get("last_watered_minute"))
     if elapsed_cd < CFG.COOLDOWN_MINUTES:
-        resp["blocked_reason"] = f"Cooldown: sisa {CFG.COOLDOWN_MINUTES - elapsed_cd} menit"
+        resp["blocked_reason"] = (
+            f"Cooldown: sisa {CFG.COOLDOWN_MINUTES - elapsed_cd} menit"
+        )
         resp["decision_path"].append("B5-cooldown")
         return resp
 
-    # B6. POMPA ON — KNN memutuskan
+    # B6. POMPA ON
     now_ts = datetime.now().isoformat()
-    pump_u = dict(pump_status=True, pump_start_minute=current_total_minutes, pump_start_ts=now_ts)
+    pump_u = dict(pump_status=True,
+                  pump_start_minute=current_total_minutes,
+                  pump_start_ts=now_ts)
     await _add_pump_on_updates(pump_u)
     resp["pending_updates"].update(pump_u)
     resp["action"] = "on"
@@ -702,38 +678,23 @@ async def _evaluate_smart_watering_async(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPER INTERNAL: jalankan classify + engine TANPA menyentuh Supabase
-# (untuk /test-knn)
+# HELPER TEST KNN
 # ══════════════════════════════════════════════════════════════════════════════
 def _run_test_classify(req: TestKNNRequest) -> dict:
-    """
-    Jalankan KNN classify + simulasi smart watering engine
-    menggunakan state kosong (tidak pakai Supabase, tidak tulis apapun).
-    """
     knn = classify(
-        soil      = req.soil_moisture,
-        temp      = req.temperature,
-        rh        = req.air_humidity,
-        hour      = req.hour,
-        soil_prev = req.soil_prev,
-        temp_prev = req.temp_prev,
-        rh_prev   = req.rh_prev,
+        soil=req.soil_moisture, temp=req.temperature,
+        rh=req.air_humidity, hour=req.hour,
+        soil_prev=req.soil_prev, temp_prev=req.temp_prev, rh_prev=req.rh_prev,
     )
 
-    # Simulasi engine dengan state bersih
-    state_sim       = dict(_STATE_DEFAULTS)
-    hour            = req.hour
-    in_window, wlbl = _in_watering_window(hour)
-    current_min     = hour * 60  # pakai menit dari jam saja (no real clock)
-
+    in_window, wlbl = _in_watering_window(req.hour)
     decision_path   = []
     aksi_pompa      = None
     alasan          = ""
     blokir          = None
 
-    # Urutan keputusan engine (versi sync untuk testing)
     if not knn["needs_watering"]:
-        blokir = f"KNN: kondisi {knn['label']} ({knn['confidence']}%) — tidak perlu siram"
+        blokir = f"KNN: {knn['label']} ({knn['confidence']}%) — tidak perlu siram"
         decision_path.append("B3-knn-no-water")
     elif knn["label"] in ("Hujan_Aktif", "Hujan_Prediksi"):
         blokir = f"KNN: {knn['label']} — siram ditunda karena hujan"
@@ -744,15 +705,10 @@ def _run_test_classify(req: TestKNNRequest) -> dict:
         blokir = f"KNN confidence {knn['confidence']}% terlalu rendah"
         decision_path.append("B4-low-confidence")
     else:
-        # Semua lolos → siram
         aksi_pompa = "on"
-        alasan     = (
-            f"KNN [{wlbl or 'darurat'}]: {knn['label']} "
-            f"({knn['confidence']}%) → POMPA ON"
-        )
+        alasan     = f"KNN [{wlbl or 'darurat'}]: {knn['label']} ({knn['confidence']}%) → POMPA ON"
         decision_path.append("B6-knn-final")
 
-    # Interpretasi label untuk orang awam
     label_icon = {
         "Siram_Segera"   : "✅ POMPA ON  — Siram sekarang!",
         "Siram_Prioritas": "🔴 POMPA ON  — DARURAT, siram segera!",
@@ -763,24 +719,18 @@ def _run_test_classify(req: TestKNNRequest) -> dict:
         "Hujan_Prediksi" : "🌦️  TAHAN      — Akan segera hujan",
     }.get(knn["label"], "❓ Tidak dikenal")
 
-    # Cek apakah ekspektasi terpenuhi
-    cocok = None
-    if req.ekspektasi:
-        cocok = (knn["label"] == req.ekspektasi)
+    cocok = (knn["label"] == req.ekspektasi) if req.ekspektasi else None
 
     return {
-        "skenario"      : req.label_skenario or "Manual",
-        "input"         : {
-            "soil_moisture": req.soil_moisture,
-            "temperature"  : req.temperature,
-            "air_humidity" : req.air_humidity,
-            "hour"         : req.hour,
-            "soil_prev"    : req.soil_prev,
-            "temp_prev"    : req.temp_prev,
+        "skenario"        : req.label_skenario or "Manual",
+        "input"           : {
+            "soil_moisture": req.soil_moisture, "temperature": req.temperature,
+            "air_humidity" : req.air_humidity,  "hour": req.hour,
+            "soil_prev"    : req.soil_prev,     "temp_prev": req.temp_prev,
             "rh_prev"      : req.rh_prev,
         },
-        "knn_result"    : knn,
-        "keputusan"     : {
+        "knn_result"      : knn,
+        "keputusan"       : {
             "label"        : knn["label"],
             "label_icon"   : label_icon,
             "aksi_pompa"   : aksi_pompa or "off/tahan",
@@ -788,167 +738,87 @@ def _run_test_classify(req: TestKNNRequest) -> dict:
             "alasan"       : alasan or blokir,
             "decision_path": decision_path,
         },
-        "validasi"      : {
-            "ekspektasi"   : req.ekspektasi,
-            "hasil"        : knn["label"],
-            "cocok"        : cocok,
-            "status"       : ("✅ BENAR" if cocok else "❌ MELESET") if cocok is not None else "—",
+        "validasi"        : {
+            "ekspektasi": req.ekspektasi, "hasil": knn["label"],
+            "cocok"     : cocok,
+            "status"    : ("✅ BENAR" if cocok else "❌ MELESET") if cocok is not None else "—",
         } if req.ekspektasi else None,
-        "jam_siram_aktif"  : in_window,
-        "window_label"     : wlbl or "di luar jam siram",
+        "jam_siram_aktif" : in_window,
+        "window_label"    : wlbl or "di luar jam siram",
         "computed_features": knn["computed_features"],
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 12 SKENARIO PRESET
+# SKENARIO PRESET
 # ══════════════════════════════════════════════════════════════════════════════
 SKENARIO_PRESET = [
-    {
-        "id": "S01", "nama": "Pagi hari — tanah kering, tidak hujan",
-        "ekspektasi": "Siram_Segera",
-        "keterangan": "Kondisi ideal untuk siram. Jam pagi, tanah kering, cuaca cerah.",
-        "data": {"soil_moisture":22,"temperature":29,"air_humidity":55,
-                 "hour":6,"soil_prev":24,"temp_prev":29,"rh_prev":54},
-    },
-    {
-        "id": "S02", "nama": "Sore hari — tanah kering, cuaca cerah",
-        "ekspektasi": "Siram_Segera",
-        "keterangan": "Jam sore, tanah kering, siram normal.",
-        "data": {"soil_moisture":25,"temperature":31,"air_humidity":58,
-                 "hour":17,"soil_prev":27,"temp_prev":32,"rh_prev":57},
-    },
-    {
-        "id": "S03", "nama": "Pagi — DARURAT sangat kering + panas ekstrem",
-        "ekspektasi": "Siram_Prioritas",
-        "keterangan": "Tanah sangat kering (<25%) dan suhu sangat panas (>34°C). Prioritas siram.",
-        "data": {"soil_moisture":14,"temperature":38,"air_humidity":35,
-                 "hour":6,"soil_prev":18,"temp_prev":39,"rh_prev":33},
-    },
-    {
-        "id": "S04", "nama": "Siang hari — kering tapi luar jam siram",
-        "ekspektasi": "Siram_Nanti",
-        "keterangan": "Tanah kering tapi jam 13:00 (bukan waktu siram). Tunggu sore.",
-        "data": {"soil_moisture":25,"temperature":33,"air_humidity":52,
-                 "hour":13,"soil_prev":27,"temp_prev":33,"rh_prev":51},
-    },
-    {
-        "id": "S05", "nama": "Tengah malam — kering, luar jadwal",
-        "ekspektasi": "Siram_Nanti",
-        "keterangan": "Jam 02:00, tanah kering. Tidak boleh siram tengah malam.",
-        "data": {"soil_moisture":28,"temperature":26,"air_humidity":65,
-                 "hour":2,"soil_prev":29,"temp_prev":27,"rh_prev":64},
-    },
-    {
-        "id": "S06", "nama": "Tanah optimal — tidak perlu siram",
-        "ekspektasi": "Optimal",
-        "keterangan": "Kelembaban tanah 55% (zona ideal 40-70%). Tidak perlu tindakan.",
-        "data": {"soil_moisture":55,"temperature":27,"air_humidity":65,
-                 "hour":6,"soil_prev":55,"temp_prev":27,"rh_prev":65},
-    },
-    {
-        "id": "S07", "nama": "Tanah terlalu basah",
-        "ekspektasi": "Basah",
-        "keterangan": "Tanah sudah sangat basah (83%). Jangan siram.",
-        "data": {"soil_moisture":83,"temperature":22,"air_humidity":88,
-                 "hour":17,"soil_prev":80,"temp_prev":22,"rh_prev":87},
-    },
-    {
-        "id": "S08", "nama": "Pagi — kering TAPI hujan deras sedang terjadi",
-        "ekspektasi": "Hujan_Aktif",
-        "keterangan": "Tanah kering tapi RH=94%, tanah naik +11% → hujan deras. Tidak perlu siram.",
-        "data": {"soil_moisture":25,"temperature":22,"air_humidity":94,
-                 "hour":6,"soil_prev":14,"temp_prev":30,"rh_prev":68},
-    },
-    {
-        "id": "S09", "nama": "Sore — RH naik drastis, tanda akan hujan",
-        "ekspektasi": "Hujan_Prediksi",
-        "keterangan": "RH naik dari 63% → 85%, suhu turun. Tanda akan hujan. Tunda siram.",
-        "data": {"soil_moisture":30,"temperature":26,"air_humidity":85,
-                 "hour":17,"soil_prev":29,"temp_prev":32,"rh_prev":63},
-    },
-    {
-        "id": "S10", "nama": "Sore panas — tanah mengering cepat (ET tinggi)",
-        "ekspektasi": "Siram_Prioritas",
-        "keterangan": "Suhu 36°C, tanah 28%, laju penguapan tinggi. Prioritas siram.",
-        "data": {"soil_moisture":22,"temperature":36,"air_humidity":38,
-                 "hour":17,"soil_prev":27,"temp_prev":37,"rh_prev":36},
-    },
-    {
-        "id": "S11", "nama": "Malam — tanah sangat kering (darurat)",
-        "ekspektasi": "Siram_Nanti",
-        "keterangan": "Jam 23:00, tanah 18%. Luar jadwal siram. Tunggu pagi.",
-        "data": {"soil_moisture":18,"temperature":24,"air_humidity":60,
-                 "hour":23,"soil_prev":20,"temp_prev":25,"rh_prev":59},
-    },
-    {
-        "id": "S12", "nama": "Pagi — kering TAPI hujan baru saja lewat",
-        "ekspektasi": "Hujan_Aktif",
-        "keterangan": "Tanah kering tapi baru naik drastis (+12%) dari hujan. RH 95%. Tidak siram.",
-        "data": {"soil_moisture":32,"temperature":23,"air_humidity":95,
-                 "hour":6,"soil_prev":20,"temp_prev":31,"rh_prev":72},
-    },
+    {"id":"S01","nama":"Pagi — tanah kering, tidak hujan","ekspektasi":"Siram_Segera",
+     "keterangan":"Kondisi ideal siram pagi.",
+     "data":{"soil_moisture":22,"temperature":29,"air_humidity":55,"hour":6,"soil_prev":24,"temp_prev":29,"rh_prev":54}},
+    {"id":"S02","nama":"Sore — tanah kering, cuaca cerah","ekspektasi":"Siram_Segera",
+     "keterangan":"Jam sore, tanah kering, siram normal.",
+     "data":{"soil_moisture":25,"temperature":31,"air_humidity":58,"hour":17,"soil_prev":27,"temp_prev":32,"rh_prev":57}},
+    {"id":"S03","nama":"Pagi — DARURAT sangat kering + panas ekstrem","ekspektasi":"Siram_Prioritas",
+     "keterangan":"Tanah sangat kering + suhu >34°C.",
+     "data":{"soil_moisture":14,"temperature":38,"air_humidity":35,"hour":6,"soil_prev":18,"temp_prev":39,"rh_prev":33}},
+    {"id":"S04","nama":"Siang — kering tapi luar jam siram","ekspektasi":"Siram_Nanti",
+     "keterangan":"Jam 13:00, bukan waktu siram.",
+     "data":{"soil_moisture":25,"temperature":33,"air_humidity":52,"hour":13,"soil_prev":27,"temp_prev":33,"rh_prev":51}},
+    {"id":"S05","nama":"Tengah malam — kering, luar jadwal","ekspektasi":"Siram_Nanti",
+     "keterangan":"Jam 02:00, tidak boleh siram malam.",
+     "data":{"soil_moisture":28,"temperature":26,"air_humidity":65,"hour":2,"soil_prev":29,"temp_prev":27,"rh_prev":64}},
+    {"id":"S06","nama":"Tanah optimal — tidak perlu siram","ekspektasi":"Optimal",
+     "keterangan":"Kelembaban 55%, zona ideal.",
+     "data":{"soil_moisture":55,"temperature":27,"air_humidity":65,"hour":6,"soil_prev":55,"temp_prev":27,"rh_prev":65}},
+    {"id":"S07","nama":"Tanah terlalu basah","ekspektasi":"Basah",
+     "keterangan":"Tanah 83%, jenuh air.",
+     "data":{"soil_moisture":83,"temperature":22,"air_humidity":88,"hour":17,"soil_prev":80,"temp_prev":22,"rh_prev":87}},
+    {"id":"S08","nama":"Pagi — kering TAPI hujan deras aktif","ekspektasi":"Hujan_Aktif",
+     "keterangan":"RH=94%, tanah naik +11%.",
+     "data":{"soil_moisture":25,"temperature":22,"air_humidity":94,"hour":6,"soil_prev":14,"temp_prev":30,"rh_prev":68}},
+    {"id":"S09","nama":"Sore — RH naik, tanda akan hujan","ekspektasi":"Hujan_Prediksi",
+     "keterangan":"RH naik dari 63% ke 85%, suhu turun.",
+     "data":{"soil_moisture":30,"temperature":26,"air_humidity":85,"hour":17,"soil_prev":29,"temp_prev":32,"rh_prev":63}},
+    {"id":"S10","nama":"Sore panas — ET tinggi","ekspektasi":"Siram_Prioritas",
+     "keterangan":"Suhu 36°C, tanah 22%, penguapan tinggi.",
+     "data":{"soil_moisture":22,"temperature":36,"air_humidity":38,"hour":17,"soil_prev":27,"temp_prev":37,"rh_prev":36}},
+    {"id":"S11","nama":"Malam — kering, luar jadwal","ekspektasi":"Siram_Nanti",
+     "keterangan":"Jam 23:00, tunggu pagi.",
+     "data":{"soil_moisture":18,"temperature":24,"air_humidity":60,"hour":23,"soil_prev":20,"temp_prev":25,"rh_prev":59}},
+    {"id":"S12","nama":"Pagi — habis hujan, tanah naik drastis","ekspektasi":"Hujan_Aktif",
+     "keterangan":"Tanah naik +12%, RH 95%.",
+     "data":{"soil_moisture":32,"temperature":23,"air_humidity":95,"hour":6,"soil_prev":20,"temp_prev":31,"rh_prev":72}},
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ★★★ ENDPOINT PENGUJIAN POSTMAN ★★★
+# ENDPOINTS PENGUJIAN
 # ══════════════════════════════════════════════════════════════════════════════
-
-@app.post(
-    "/test-knn",
-    tags=["🧪 Pengujian KNN"],
-    summary="Uji KNN dengan data sensor bebas",
-    description=(
-        "**Endpoint utama untuk pengujian via Postman.**\n\n"
-        "Kirim data sensor dan lihat:\n"
-        "- Label KNN & confidence\n"
-        "- Keputusan pompa (ON/OFF)\n"
-        "- Fitur yang dihitung otomatis (rain_score, ET, dll)\n"
-        "- Validasi apakah hasil sesuai ekspektasi kamu\n\n"
-        "**Tidak menyentuh Supabase** — aman untuk pengujian berulang.\n\n"
-        "Contoh skenario yang bisa dicoba:\n"
-        "- Pagi hari, tanah kering → harap `Siram_Segera`\n"
-        "- RH tinggi, tanah naik → harap `Hujan_Aktif`\n"
-        "- Siang hari, luar jadwal → harap `Siram_Nanti`"
-    ),
-)
+@app.post("/test-knn", tags=["🧪 Pengujian KNN"],
+          summary="Uji KNN dengan data sensor bebas (tidak sentuh Supabase)")
 async def test_knn(req: TestKNNRequest):
     return _run_test_classify(req)
 
 
-@app.post(
-    "/test-knn/batch",
-    tags=["🧪 Pengujian KNN"],
-    summary="Uji banyak skenario sekaligus (maks 50)",
-    description=(
-        "Kirim array skenario dan dapatkan hasil semua sekaligus.\n"
-        "Berguna untuk menguji keseluruhan skenario sebelum deploy.\n\n"
-        "Lihat `/test-knn/skenario` untuk mengambil 12 skenario preset yang siap pakai."
-    ),
-)
+@app.post("/test-knn/batch", tags=["🧪 Pengujian KNN"],
+          summary="Uji banyak skenario sekaligus (maks 50)")
 async def test_knn_batch(req: TestKNNBatchRequest):
-    hasil_list = []
-    benar = 0
-    total_dengan_ekspektasi = 0
-
+    hasil_list, benar, total_exp = [], 0, 0
     for item in req.skenario:
         hasil = _run_test_classify(item)
         hasil_list.append(hasil)
         if hasil.get("validasi"):
-            total_dengan_ekspektasi += 1
+            total_exp += 1
             if hasil["validasi"].get("cocok"):
                 benar += 1
-
-    akurasi = round(benar / total_dengan_ekspektasi * 100, 1) if total_dengan_ekspektasi else None
-
+    akurasi = round(benar / total_exp * 100, 1) if total_exp else None
     return {
-        "total_skenario"         : len(hasil_list),
-        "total_dengan_ekspektasi": total_dengan_ekspektasi,
-        "benar"                  : benar,
-        "meleset"                : total_dengan_ekspektasi - benar,
-        "akurasi_batch"          : f"{akurasi}%" if akurasi is not None else "N/A",
-        "ringkasan_label"        : {
+        "total_skenario": len(hasil_list),
+        "total_dengan_ekspektasi": total_exp,
+        "benar": benar, "meleset": total_exp - benar,
+        "akurasi_batch": f"{akurasi}%" if akurasi is not None else "N/A",
+        "ringkasan_label": {
             lbl: sum(1 for h in hasil_list if h["knn_result"]["label"] == lbl)
             for lbl in ["Siram_Segera","Siram_Prioritas","Siram_Nanti",
                         "Optimal","Basah","Hujan_Aktif","Hujan_Prediksi"]
@@ -957,102 +827,69 @@ async def test_knn_batch(req: TestKNNBatchRequest):
     }
 
 
-@app.get(
-    "/test-knn/skenario",
-    tags=["🧪 Pengujian KNN"],
-    summary="Ambil 12 skenario preset siap pakai",
-    description=(
-        "Mengembalikan 12 skenario pengujian yang sudah dirancang untuk menguji "
-        "semua kondisi: normal, hujan, panas, luar jadwal, dll.\n\n"
-        "Salin `data` dari skenario ini ke body `/test-knn` atau `/test-knn/batch`."
-    ),
-)
+@app.get("/test-knn/skenario", tags=["🧪 Pengujian KNN"],
+         summary="Ambil 12 skenario preset siap pakai")
 async def get_skenario_preset():
-    # Jalankan semua preset dan tampilkan hasilnya sekaligus
     hasil_list = []
     for s in SKENARIO_PRESET:
-        req = TestKNNRequest(
-            **s["data"],
-            label_skenario=f"{s['id']} — {s['nama']}",
-            ekspektasi=s["ekspektasi"],
-        )
+        req  = TestKNNRequest(**s["data"], label_skenario=f"{s['id']} — {s['nama']}",
+                               ekspektasi=s["ekspektasi"])
         hasil = _run_test_classify(req)
         hasil["keterangan"] = s["keterangan"]
         hasil_list.append(hasil)
-
     benar = sum(1 for h in hasil_list if h.get("validasi") and h["validasi"].get("cocok"))
     return {
-        "info"            : "12 skenario preset untuk menguji semua kondisi KNN",
-        "total"           : len(hasil_list),
-        "benar"           : benar,
-        "akurasi_preset"  : f"{round(benar/len(hasil_list)*100,1)}%",
-        "skenario"        : hasil_list,
+        "info": "12 skenario preset untuk menguji semua kondisi KNN",
+        "total": len(hasil_list), "benar": benar,
+        "akurasi_preset": f"{round(benar/len(hasil_list)*100,1)}%",
+        "skenario": hasil_list,
     }
 
 
-@app.post(
-    "/test-knn/reset",
-    tags=["🧪 Pengujian KNN"],
-    summary="Reset state cooldown untuk pengujian ulang",
-    description=(
-        "Reset field cooldown di Supabase agar kamu bisa menguji `pump ON` berulang kali "
-        "tanpa perlu menunggu 60 menit.\n\n"
-        "**Hati-hati: gunakan hanya saat testing, jangan di production.**"
-    ),
-    dependencies=[Depends(verify_api_key)],
-)
+@app.post("/test-knn/reset", tags=["🧪 Pengujian KNN"],
+          summary="Reset state cooldown + OVR untuk pengujian ulang",
+          dependencies=[Depends(verify_api_key)])
 async def reset_test_state():
     loop = asyncio.get_event_loop()
-
     reset_fields = {
-        "last_watered_minute" : None,
-        "last_watered_ts"     : None,
-        "pump_status"         : False,
-        "pump_start_ts"       : None,
-        "pump_start_minute"   : None,
-        "manual_override"     : False,
-        "manual_override_ts"  : None,
-        "session_count_today" : 0,
-        "last_sensor_ts"      : None,
-        "last_sensor_soil"    : None,
-        "last_soil_moisture"  : None,
-        "last_temperature"    : None,
-        "last_air_humidity"   : None,
-        "last_rain_score"     : None,
-        "missed_session"      : False,
+        "last_watered_minute": None, "last_watered_ts": None,
+        "pump_status": False, "pump_start_ts": None, "pump_start_minute": None,
+        "manual_override": False, "manual_override_ts": None,
+        "session_count_today": 0, "last_sensor_ts": None, "last_sensor_soil": None,
+        "last_soil_moisture": None, "last_temperature": None,
+        "last_air_humidity": None, "last_rain_score": None, "missed_session": False,
     }
-
     try:
         await loop.run_in_executor(_executor, lambda: _sb_update_state_sync(**reset_fields))
-        # Invalidate cache
-        _rt_cache["data"]      = None
+        _rt_cache["data"] = None
         _rt_cache["timestamp"] = 0.0
         return {
-            "success"       : True,
-            "message"       : "State cooldown berhasil direset. Siap untuk pengujian ulang.",
-            "reset_fields"  : list(reset_fields.keys()),
-            "timestamp"     : datetime.now().isoformat(),
+            "success": True,
+            "message": "State + OVR berhasil direset. Siap pengujian ulang.",
+            "ovr_timeout_seconds": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
+            "reset_fields": list(reset_fields.keys()),
+            "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Gagal reset state: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT PRODUKSI (tidak berubah dari versi sebelumnya)
+# ENDPOINTS PRODUKSI
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/", tags=["Sistem"])
 def root():
     return {
-        "status"      : "online",
-        "version"     : APP_VERSION,
-        "model_ready" : knn_model is not None,
+        "status": "online", "version": APP_VERSION,
+        "model_ready": knn_model is not None,
+        "ovr_timeout_seconds": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
         "endpoints_test": {
             "GET  /test-knn/skenario": "12 skenario preset siap uji",
             "POST /test-knn"         : "Uji 1 skenario bebas",
             "POST /test-knn/batch"   : "Uji banyak skenario sekaligus",
-            "POST /test-knn/reset"   : "Reset cooldown untuk pengujian ulang",
+            "POST /test-knn/reset"   : "Reset OVR + cooldown",
         },
-        "model_info"  : {
+        "model_info": {
             "version"   : model_meta.get("version"),
             "algorithm" : model_meta.get("algorithm"),
             "best_k"    : model_meta.get("best_k"),
@@ -1102,11 +939,15 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         smart_eval = await _evaluate_smart_watering_async(
             knn_result=knn_result, hour=hour, minute=minute,
             soil_moisture=data.soil_moisture, air_humidity=data.air_humidity,
-            temperature=data.temperature, state=state, current_total_minutes=current_total_min,
+            temperature=data.temperature, state=state,
+            current_total_minutes=current_total_min,
         )
         final_action = smart_eval.get("action")
 
-    pump_status_logged = (final_action == "on") if final_action is not None else state["pump_status"]
+    pump_status_logged = (
+        (final_action == "on") if final_action is not None else state["pump_status"]
+    )
+
     sensor_updates = dict(
         last_label=knn_result["label"], last_updated=timestamp,
         last_soil_moisture=data.soil_moisture, last_temperature=data.temperature,
@@ -1129,34 +970,39 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
         "description": knn_result.get("description", ""),
         "probabilities": knn_result["probabilities"],
         "computed_features": knn_result.get("computed_features", {}),
-        "pump_status": pump_status_logged, "mode": state["mode"], "hour": hour, "minute": minute,
+        "pump_status": pump_status_logged, "mode": state["mode"],
+        "hour": hour, "minute": minute,
     }
 
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(_executor, lambda: _sb_update_state_sync(**all_updates))
-        asyncio.ensure_future(loop.run_in_executor(_executor,
-                                                    lambda: _sb_insert_sensor_sync(sensor_row)))
+        asyncio.ensure_future(
+            loop.run_in_executor(_executor, lambda: _sb_insert_sensor_sync(sensor_row))
+        )
     except Exception as e:
         log.error("State write gagal: %s", e)
 
     new_state = _get_state()
     return {
         "received": True, "timestamp": timestamp,
-        "device_time": f"{hour:02d}:{minute:02d}", "time_source": time_source, "debounced": False,
+        "device_time": f"{hour:02d}:{minute:02d}", "time_source": time_source,
+        "debounced": False,
         "sensor": {"soil_moisture": data.soil_moisture, "temperature": data.temperature,
                    "air_humidity": data.air_humidity},
-        "classification": knn_result, "pump_status": new_state["pump_status"],
+        "classification": knn_result,
+        "pump_status": new_state["pump_status"],
         "pump_action": final_action, "mode": new_state["mode"],
         "auto_info": {
-            "reason": smart_eval.get("reason", ""),
-            "blocked_reason": smart_eval.get("blocked_reason"),
-            "decision_path": smart_eval.get("decision_path", []),
-            "knn_label": smart_eval.get("knn_label"),
-            "knn_confidence": smart_eval.get("knn_confidence"),
+            "reason"           : smart_eval.get("reason", ""),
+            "blocked_reason"   : smart_eval.get("blocked_reason"),
+            "decision_path"    : smart_eval.get("decision_path", []),
+            "knn_label"        : smart_eval.get("knn_label"),
+            "knn_confidence"   : smart_eval.get("knn_confidence"),
             "knn_probabilities": smart_eval.get("knn_probabilities"),
-            "knn_computed": smart_eval.get("knn_computed"),
-            "manual_override": new_state.get("manual_override", False),
+            "knn_computed"     : smart_eval.get("knn_computed"),
+            "manual_override"  : new_state.get("manual_override", False),
+            "ovr_expire_seconds": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
         } if state["mode"] == "auto" else None,
     }
 
@@ -1164,8 +1010,11 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
 @app.get("/pump-status", tags=["Produksi"], dependencies=[Depends(verify_api_key)])
 def get_pump_status():
     state = _get_state()
-    return {"pump_status": state["pump_status"], "mode": state["mode"],
-            "manual_override": state.get("manual_override", False)}
+    return {
+        "pump_status"    : state["pump_status"],
+        "mode"           : state["mode"],
+        "manual_override": state.get("manual_override", False),
+    }
 
 
 @app.post("/control", tags=["Produksi"], dependencies=[Depends(verify_api_key)])
@@ -1173,32 +1022,40 @@ async def control_pump(cmd: ControlCommand):
     action = (cmd.action or "").lower().strip()
     if action not in ("on", "off"):
         raise HTTPException(status_code=400, detail="Action harus 'on' atau 'off'.")
-    mode = (cmd.mode or "manual").lower().strip()
-    if mode not in ("auto", "manual"):
-        mode = "manual"
+    mode_str = (cmd.mode or "manual").lower().strip()
+    if mode_str not in ("auto", "manual"):
+        mode_str = "manual"
     loop = asyncio.get_event_loop()
     async with _control_lock:
         state   = await loop.run_in_executor(_executor, _sb_get_state_sync)
         pump_on = action == "on"
         now_ts  = datetime.now().isoformat()
-        if state["pump_status"] == pump_on and state["mode"] == mode:
-            return {"success": True, "debounced": True, "pump_status": state["pump_status"],
-                    "mode": state["mode"], "manual_override": state.get("manual_override", False),
-                    "timestamp": now_ts}
-        update_kwargs: dict = {"last_control_ts": now_ts, "mode": mode}
+        if state["pump_status"] == pump_on and state["mode"] == mode_str:
+            return {
+                "success": True, "debounced": True,
+                "pump_status": state["pump_status"], "mode": state["mode"],
+                "manual_override": state.get("manual_override", False),
+                "timestamp": now_ts,
+            }
+        update_kwargs: dict = {"last_control_ts": now_ts, "mode": mode_str}
         if state["pump_status"] != pump_on:
             update_kwargs["pump_status"] = pump_on
             if not pump_on:
                 cur_min = _total_minutes(*_resolve_time_wit(None, None, None)[:2])
-                update_kwargs.update(pump_start_ts=None, pump_start_minute=None,
-                                     last_watered_ts=now_ts, last_watered_minute=cur_min,
-                                     manual_override=True, manual_override_ts=now_ts)
+                update_kwargs.update(
+                    pump_start_ts=None, pump_start_minute=None,
+                    last_watered_ts=now_ts, last_watered_minute=cur_min,
+                    manual_override=True, manual_override_ts=now_ts,
+                )
+                log.info("[OVR] Aktif %ds (3 menit) dari /control OFF.", CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS)
             else:
                 now_utc = datetime.utcnow()
                 h_wit   = (now_utc.hour + 9) % 24
-                update_kwargs.update(pump_start_ts=now_ts,
-                                     pump_start_minute=_total_minutes(h_wit, now_utc.minute),
-                                     manual_override=False, manual_override_ts=None)
+                update_kwargs.update(
+                    pump_start_ts=now_ts,
+                    pump_start_minute=_total_minutes(h_wit, now_utc.minute),
+                    manual_override=False, manual_override_ts=None,
+                )
                 async with _daily_safety_lock:
                     _daily_counter_reset_if_new_day()
                     _daily_safety["watering_count"] += 1
@@ -1206,15 +1063,21 @@ async def control_pump(cmd: ControlCommand):
                 update_kwargs["session_count_today"] = new_count
                 update_kwargs["session_count_date"]  = date.today().isoformat()
         try:
-            await loop.run_in_executor(_executor, lambda: _sb_update_state_sync(**update_kwargs))
+            await loop.run_in_executor(_executor,
+                                       lambda: _sb_update_state_sync(**update_kwargs))
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Gagal menyimpan: {e}")
         new_state = _normalize_state({**(_rt_cache["data"] or {}), **update_kwargs})
         _rt_cache["data"]      = new_state
         _rt_cache["timestamp"] = time.monotonic()
-        return {"success": True, "debounced": False, "pump_status": new_state["pump_status"],
-                "mode": new_state["mode"], "manual_override": new_state.get("manual_override", False),
-                "watering_today": _daily_safety["watering_count"], "timestamp": now_ts}
+        return {
+            "success": True, "debounced": False,
+            "pump_status": new_state["pump_status"], "mode": new_state["mode"],
+            "manual_override": new_state.get("manual_override", False),
+            "ovr_expire_seconds": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
+            "watering_today": _daily_safety["watering_count"],
+            "timestamp": now_ts,
+        }
 
 
 @app.get("/status", tags=["Produksi"], dependencies=[Depends(verify_api_key)])
@@ -1232,11 +1095,16 @@ async def get_status():
     latest = await loop.run_in_executor(_executor, _get_latest)
     async with _daily_safety_lock:
         watering_today = _daily_safety["watering_count"]
+
+    ovr_age  = _elapsed_seconds_real(state.get("manual_override_ts"))
+    ovr_sisa = max(0, int(CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - ovr_age)) if state.get("manual_override") else 0
+
     return {
         "pump_status": state["pump_status"], "mode": state["mode"],
         "last_label": state["last_label"],
         "last_updated": str(state["last_updated"]) if state["last_updated"] else None,
         "manual_override": state.get("manual_override", False),
+        "ovr_sisa_detik": ovr_sisa,
         "watering_today": watering_today,
         "last_watered_ts": str(state["last_watered_ts"]) if state.get("last_watered_ts") else None,
         "watering_windows": {
@@ -1244,9 +1112,10 @@ async def get_status():
             "evening": f"{CFG.EVENING_WINDOW[0]:02d}:00–{CFG.EVENING_WINDOW[1]:02d}:59 WIT",
         },
         "knn_config": {
-            "confidence_min": CFG.KNN_CONFIDENCE_MIN,
-            "critical_dry"  : CFG.CRITICAL_DRY,
-            "needs_watering": list(CFG.NEEDS_WATERING_LABELS),
+            "confidence_min"       : CFG.KNN_CONFIDENCE_MIN,
+            "critical_dry"         : CFG.CRITICAL_DRY,
+            "needs_watering"       : list(CFG.NEEDS_WATERING_LABELS),
+            "ovr_expire_seconds"   : CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
         },
         "model_info": {
             "algorithm": model_meta.get("algorithm"), "version": model_meta.get("version"),
