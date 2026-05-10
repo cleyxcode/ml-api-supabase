@@ -33,9 +33,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-APP_VERSION = "11.2.0"
+APP_VERSION = "11.3.0"
 # ═══════════════════════════════════════════════════════════════════════════════
-# v11.2.0 — Fix OVR loop bug + OVR timeout diubah ke 3 menit (180 detik)
+# v11.3.0 — Fix OVR loop: invalidate cache saat expired + /pump-status ikut cek expiry
 #
 # ROOT CAUSE BUG OVR LOOP:
 #   Di _evaluate_smart_watering_async, ketika OVR aktif dan masih dalam batas
@@ -559,6 +559,10 @@ async def _evaluate_smart_watering_async(
                 manual_override    = False,
                 manual_override_ts = None,
             )
+            # [FIX] Invalidate cache agar /pump-status tidak baca state lama
+            # yang masih punya manual_override=True
+            _rt_cache["data"]      = None
+            _rt_cache["timestamp"] = 0.0
 
     async def _add_pump_on_updates(upd: dict):
         async with _daily_safety_lock:
@@ -1010,10 +1014,28 @@ async def receive_sensor(data: SensorData, bg_tasks: BackgroundTasks):
 @app.get("/pump-status", tags=["Produksi"], dependencies=[Depends(verify_api_key)])
 def get_pump_status():
     state = _get_state()
+
+    # [FIX] Cek apakah OVR sudah expired di sini juga
+    # Ini mencegah /pump-status mengembalikan manual_override=True
+    # dari cache lama setelah OVR seharusnya sudah reset
+    ovr_active = state.get("manual_override", False)
+    if ovr_active:
+        age = _elapsed_seconds_real(state.get("manual_override_ts"))
+        if age >= CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS:
+            # OVR expired — reset langsung di response dan Supabase
+            log.info("[OVR] Expired terdeteksi di /pump-status (%ds) — reset.", int(age))
+            try:
+                _sb_update_state_sync(manual_override=False, manual_override_ts=None)
+            except Exception:
+                pass
+            _rt_cache["data"]      = None
+            _rt_cache["timestamp"] = 0.0
+            ovr_active = False
+
     return {
         "pump_status"    : state["pump_status"],
         "mode"           : state["mode"],
-        "manual_override": state.get("manual_override", False),
+        "manual_override": ovr_active,
     }
 
 
