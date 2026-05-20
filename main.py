@@ -33,28 +33,30 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-APP_VERSION = "11.4.0"
+APP_VERSION = "11.5.0"
 # ═══════════════════════════════════════════════════════════════════════════════
-# v11.4.0 — Fix rain_score false positive untuk iklim lembab tropis (Ambon)
+# v11.5.0 — Fix fitur mismatch: model KNN v4 menggunakan 8 fitur, bukan 10.
 #
-# ROOT CAUSE BUG HUJAN_AKTIF FALSE POSITIVE:
-#   _compute_rain_score() menggunakan threshold RH >= 92 → score +50.
-#   Di Ambon, RH 85-95% adalah kondisi NORMAL sehari-hari bahkan cuaca cerah.
-#   Akibatnya rain_score selalu tinggi → KNN prediksi Hujan_Aktif 100%
-#   padahal tidak ada hujan sama sekali.
+# ROOT CAUSE BUG "X has 10 features, but StandardScaler is expecting 8":
+#   classify() mengirim 10 fitur ke scaler:
+#     [soil, temp, rh, hour_sin, hour_cos, rain_score, rain_score_prev,
+#      soil_trend, et, is_hot]
+#   Padahal model dilatih dengan 8 fitur (FEATURES_USED di notebook v4):
+#     [soil_moisture, temperature, air_humidity, hour_sin, hour_cos,
+#      soil_trend, evapotranspiration, is_hot]
 #
 # FIX:
-#   1. Naikkan threshold RH di _compute_rain_score():
-#      - RH >= 97 → +40 (benar-benar hujan lebat)
-#      - RH >= 94 → +20 (kemungkinan hujan)
-#      - RH >= 91 → +8  (lembab tinggi, belum tentu hujan)
-#   2. Tambah RAIN_SCORE_THRESHOLD = 60 di WateringConfig.
-#      Rain score < 60 tidak cukup untuk trigger label hujan.
-#   3. Penyiraman di window wajib pagi/sore TETAP jalan
-#      walau rain_score tinggi (abaikan hujan di jam siram).
-#   4. Blok A3 (pompa ON + label hujan) dan B3 (label hujan blokir pompa)
-#      keduanya skip jika sedang di dalam watering window.
+#   1. Hapus rain_score dan rain_score_prev dari array X (tidak dipakai model).
+#   2. rain_score TETAP dihitung — digunakan oleh logika keputusan watering engine
+#      (threshold deteksi hujan, false-positive Ambon, dll) dan debug output.
+#   3. Parameter rain_score_prev tetap ada di signature classify() untuk
+#      kompatibilitas, tapi tidak dikirim ke scaler.
 #
+# MODEL FEATURES (8):
+#   soil_moisture | temperature | air_humidity | hour_sin | hour_cos
+#   soil_trend | evapotranspiration | is_hot
+#
+# v11.4.0 — Fix rain_score false positive untuk iklim lembab tropis (Ambon)
 # v11.3.0 — Fix OVR loop: invalidate cache saat expired + /pump-status ikut cek expiry
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -115,10 +117,17 @@ class WateringConfig:
 
     HOT_TEMP_THRESHOLD = 34.0
 
-    # [FIX v11.4.0] Threshold rain_score minimum untuk dianggap hujan.
-    # Di bawah nilai ini, label hujan diabaikan meskipun RH tinggi.
-    # Iklim Ambon: RH tinggi adalah normal → butuh threshold lebih tinggi.
+    # Threshold rain_score untuk logika keputusan (BUKAN input model).
+    # rain_score dihitung dari RH/soil_delta/temp_drop dan hanya dipakai
+    # di watering engine untuk mendeteksi hujan false-positive Ambon.
     RAIN_SCORE_THRESHOLD = 60.0
+
+    # 8 fitur yang digunakan model (urutan harus sama persis dengan training)
+    MODEL_FEATURES = [
+        'soil_moisture', 'temperature', 'air_humidity',
+        'hour_sin', 'hour_cos',
+        'soil_trend', 'evapotranspiration', 'is_hot',
+    ]
 
 
 CFG = WateringConfig()
@@ -126,7 +135,7 @@ CFG = WateringConfig()
 app = FastAPI(
     title="Siram Pintar API",
     description=(
-        "Sistem Penyiraman IoT — KNN Super Adaptif 10 Fitur v11.4\n\n"
+        "Sistem Penyiraman IoT — KNN v4 Ambon 8 Fitur v11.5\n\n"
         "### Endpoint Pengujian (Postman)\n"
         "- `POST /test-knn` — Uji KNN dengan data sensor bebas\n"
         "- `POST /test-knn/batch` — Uji banyak skenario sekaligus\n"
@@ -226,8 +235,9 @@ async def startup():
         raise RuntimeError("SUPABASE_URL / SUPABASE_KEY belum di-set!")
 
     _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    log.info("Siram Pintar API v%s dimulai. OVR timeout=%ds, RainThreshold=%.0f",
-             APP_VERSION, CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS, CFG.RAIN_SCORE_THRESHOLD)
+    log.info("Siram Pintar API v%s dimulai. OVR timeout=%ds, RainThreshold=%.0f, ModelFeatures=%d",
+             APP_VERSION, CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
+             CFG.RAIN_SCORE_THRESHOLD, len(CFG.MODEL_FEATURES))
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(_executor, _sb_ensure_state_row)
@@ -242,10 +252,23 @@ async def startup():
         if os.path.exists(META_PATH):
             with open(META_PATH) as f:
                 model_meta = json.load(f)
-        log.info("Model KNN v%s dimuat. K=%s, Akurasi=%.2f%%",
+
+        # Validasi jumlah fitur model vs CFG
+        n_model = knn_model.n_features_in_ if hasattr(knn_model, 'n_features_in_') else None
+        n_cfg   = len(CFG.MODEL_FEATURES)
+        if n_model and n_model != n_cfg:
+            log.error(
+                "MISMATCH FITUR! Model butuh %d fitur, CFG.MODEL_FEATURES=%d. "
+                "Sesuaikan CFG.MODEL_FEATURES!", n_model, n_cfg
+            )
+        else:
+            log.info("Validasi fitur OK: model=%s, cfg=%s", n_model, n_cfg)
+
+        log.info("Model KNN v%s dimuat. K=%s, Akurasi=%.2f%%, Fitur=%s",
                  model_meta.get("version", "?"),
                  model_meta.get("best_k"),
-                 float(model_meta.get("accuracy", 0)) * 100)
+                 float(model_meta.get("accuracy", 0)) * 100,
+                 CFG.MODEL_FEATURES)
     except Exception as exc:
         log.error("Gagal memuat model: %s", exc)
 
@@ -301,25 +324,20 @@ def _encode_hour(hour: int) -> tuple:
     return float(np.sin(rad)), float(np.cos(rad))
 
 
-# [FIX v11.4.0] _compute_rain_score — threshold dinaikkan untuk iklim Ambon.
-# RH 85-95% adalah NORMAL di Ambon (kota paling lembab di Indonesia),
-# bukan indikator hujan. Sinyal utama hujan adalah kenaikan soil_delta
-# yang drastis (air masuk ke tanah), bukan RH semata.
 def _compute_rain_score(rh: float, soil_delta: float, temp_drop: float) -> float:
+    """
+    Hitung rain_score untuk LOGIKA KEPUTUSAN saja (tidak masuk ke model KNN).
+    Threshold dinaikkan untuk iklim lembab Ambon — RH 85-95% adalah normal.
+    """
     score = 0.0
+    if   rh >= 97: score += 40
+    elif rh >= 94: score += 20
+    elif rh >= 91: score +=  8
 
-    # RH threshold dinaikkan jauh — RH tinggi di Ambon bukan berarti hujan
-    if   rh >= 97: score += 40   # benar-benar sangat lembab → kemungkinan hujan lebat
-    elif rh >= 94: score += 20   # lembab ekstrem → mungkin hujan
-    elif rh >= 91: score +=  8   # lembab tinggi → normal untuk Ambon, skor kecil
+    if   soil_delta >= 10: score += 45
+    elif soil_delta >=  5: score += 25
+    elif soil_delta >=  2: score +=  8
 
-    # soil_delta adalah indikator TERKUAT bahwa ada air masuk ke tanah
-    # (pompa ON atau hujan nyata menaikkan soil moisture drastis)
-    if   soil_delta >= 10: score += 45  # kenaikan sangat drastis → hampir pasti hujan/pompa
-    elif soil_delta >=  5: score += 25  # kenaikan signifikan
-    elif soil_delta >=  2: score +=  8  # kenaikan kecil → bisa noise sensor
-
-    # temp_drop hanya berarti jika cukup besar (hujan biasanya turunkan suhu >5C)
     if   temp_drop >= 5: score += 15
     elif temp_drop >= 3: score +=  5
 
@@ -386,26 +404,21 @@ def _should_skip_sensor(data: SensorData, state: dict, pump_is_on: bool) -> bool
     return False
 
 
-# [FIX v11.4.0] Helper: apakah label termasuk kategori "hujan" dan
-# rain_score-nya cukup tinggi (>= RAIN_SCORE_THRESHOLD) untuk dipercaya.
-# Jika rain_score rendah, label hujan dianggap false positive dan diabaikan.
-def _is_rain_label_credible(knn_result: dict) -> bool:
-    label      = knn_result.get("label", "")
-    rain_score = knn_result.get("computed_features", {}).get("rain_score", 0.0)
-    if label not in ("Hujan_Aktif", "Hujan_Prediksi"):
-        return False
-    return rain_score >= CFG.RAIN_SCORE_THRESHOLD
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# CLASSIFY
+# CLASSIFY — 8 FITUR (sesuai model KNN v4 Ambon)
+#
+# FITUR MODEL (urutan wajib sama dengan training notebook):
+#   [soil_moisture, temperature, air_humidity, hour_sin, hour_cos,
+#    soil_trend, evapotranspiration, is_hot]
+#
+# rain_score TIDAK masuk ke model — hanya untuk logika keputusan watering engine.
 # ══════════════════════════════════════════════════════════════════════════════
 def classify(
     soil: float, temp: float, rh: float, hour: int,
     soil_prev       : Optional[float] = None,
     temp_prev       : Optional[float] = None,
     rh_prev         : Optional[float] = None,
-    rain_score_prev : Optional[float] = None,
+    rain_score_prev : Optional[float] = None,  # disimpan untuk referensi, tidak ke model
 ) -> dict:
     if knn_model is None or scaler is None:
         raise HTTPException(status_code=503, detail="Model KNN belum dimuat.")
@@ -414,19 +427,27 @@ def classify(
         _temp_prev = temp_prev if temp_prev is not None else temp
         _rh_prev   = rh_prev   if rh_prev   is not None else rh
 
-        soil_delta = soil - _soil_prev
-        temp_drop  = _temp_prev - temp
-        soil_trend = soil_delta
+        soil_delta  = soil - _soil_prev
+        temp_drop   = _temp_prev - temp
+        soil_trend  = soil_delta   # alias (nama fitur di model: soil_trend)
 
+        # rain_score dihitung untuk logika keputusan & debug — TIDAK masuk ke X
         rain_score = _compute_rain_score(rh, soil_delta, temp_drop)
         _rs_prev   = (rain_score_prev if rain_score_prev is not None
                       else _compute_rain_score(_rh_prev, 0.0, 0.0))
-        et         = _compute_evapotranspiration(temp, rh)
-        is_hot     = 1 if temp >= CFG.HOT_TEMP_THRESHOLD else 0
+
+        et     = _compute_evapotranspiration(temp, rh)
+        is_hot = 1 if temp >= CFG.HOT_TEMP_THRESHOLD else 0
         hour_sin, hour_cos = _encode_hour(hour)
 
-        X        = np.array([[soil, temp, rh, hour_sin, hour_cos,
-                               rain_score, _rs_prev, soil_trend, et, is_hot]])
+        # ── 8 fitur sesuai FEATURES_USED notebook v4 ──────────────────────────
+        # [soil_moisture, temperature, air_humidity, hour_sin, hour_cos,
+        #  soil_trend, evapotranspiration, is_hot]
+        X        = np.array([[soil, temp, rh,
+                               hour_sin, hour_cos,
+                               soil_trend, et, is_hot]])
+        # ──────────────────────────────────────────────────────────────────────
+
         X_scaled = scaler.transform(X)
 
         label  = knn_model.predict(X_scaled)[0]
@@ -435,16 +456,13 @@ def classify(
                   for cls, p in zip(knn_model.classes_, proba)}
         conf   = round(float(max(proba)) * 100, 2)
 
-        # [FIX v11.4.0] Jika KNN memprediksi label hujan TAPI rain_score
-        # di bawah threshold → ini false positive (iklim lembab).
-        # Override label ke "Optimal" atau "Siram_Nanti" berdasarkan soil.
+        # Override label hujan jika rain_score terlalu rendah (false positive Ambon)
         if label in ("Hujan_Aktif", "Hujan_Prediksi") and rain_score < CFG.RAIN_SCORE_THRESHOLD:
             log.info(
                 "[FIX] Label hujan '%s' dibatalkan — rain_score=%.1f < threshold=%.0f. "
                 "RH=%.1f%%, soil_delta=%.1f. Override ke label berbasis soil.",
                 label, rain_score, CFG.RAIN_SCORE_THRESHOLD, rh, soil_delta
             )
-            # Tentukan label pengganti berdasarkan kondisi tanah
             if soil <= 30.0:
                 label = "Siram_Segera"
             elif soil <= 44.0:
@@ -453,9 +471,6 @@ def classify(
                 label = "Optimal"
             else:
                 label = "Basah"
-
-            # Recalculate confidence dari distribusi probabilitas yang ada
-            # (ambil probabilitas label pengganti jika ada, else set 70%)
             conf = round(confs.get(label, 70.0), 2)
 
         return {
@@ -465,6 +480,8 @@ def classify(
             "needs_watering"    : label in CFG.NEEDS_WATERING_LABELS,
             "description"       : model_meta.get("label_desc", {}).get(label, ""),
             "computed_features" : {
+                # rain_score ada di sini untuk debug & watering engine,
+                # tapi TIDAK dikirim ke model scaler
                 "rain_score"        : round(rain_score, 2),
                 "rain_score_prev"   : round(_rs_prev, 2),
                 "soil_trend"        : round(soil_trend, 2),
@@ -473,10 +490,11 @@ def classify(
                 "hour_sin"          : round(hour_sin, 4),
                 "hour_cos"          : round(hour_cos, 4),
             },
-            "k"     : model_meta.get("best_k", knn_model.n_neighbors),
-            "metric": model_meta.get("metric", "euclidean"),
-            # [FIX] Tambahkan rain_score_threshold di response untuk debugging
-            "rain_score_threshold": CFG.RAIN_SCORE_THRESHOLD,
+            "model_features_used"    : CFG.MODEL_FEATURES,
+            "model_features_count"   : len(CFG.MODEL_FEATURES),
+            "k"                      : model_meta.get("best_k", knn_model.n_neighbors),
+            "metric"                 : model_meta.get("metric", "euclidean"),
+            "rain_score_threshold"   : CFG.RAIN_SCORE_THRESHOLD,
         }
     except HTTPException:
         raise
@@ -579,15 +597,11 @@ async def _evaluate_smart_watering_async(
         "pending_updates"  : {},
     }
 
-    # Tentukan apakah sedang di window siram wajib (pagi/sore)
     in_window, window_label = _in_watering_window(hour)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # B1. Manual Override
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── B1. Manual Override ───────────────────────────────────────────────────
     if state.get("manual_override"):
         age = _elapsed_seconds_real(state.get("manual_override_ts"))
-
         if age < CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS:
             remaining = int(CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS - age)
             resp["blocked_reason"] = (
@@ -600,7 +614,6 @@ async def _evaluate_smart_watering_async(
                 manual_override_ts = state.get("manual_override_ts"),
             )
             return resp
-
         else:
             log.info("[OVR] Expired setelah %ds — reset otomatis.", int(age))
             resp["pending_updates"].update(
@@ -618,14 +631,12 @@ async def _evaluate_smart_watering_async(
         upd["session_count_today"] = cnt
         upd["session_count_date"]  = date.today().isoformat()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Pompa sedang ON
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Pompa sedang ON ───────────────────────────────────────────────────────
     if state["pump_status"]:
         elapsed_sec = _elapsed_seconds_real(state.get("pump_start_ts"))
         max_sec     = CFG.MAX_PUMP_DURATION_MINUTES * 60
 
-        # A1. Durasi maksimum tercapai → matikan pompa
+        # A1. Durasi maksimum
         if elapsed_sec >= max_sec:
             resp["pending_updates"].update(
                 pump_status=False, last_watered_minute=current_total_minutes,
@@ -637,13 +648,13 @@ async def _evaluate_smart_watering_async(
             resp["decision_path"].append("A1-max-duration")
             return resp
 
-        # A-warmup. Pompa baru nyala, tunggu minimum
+        # A-warmup
         if elapsed_sec < CFG.MIN_PUMP_DURATION_SECONDS:
             resp["reason"] = f"Warmup ({elapsed_sec:.0f}s)"
             resp["decision_path"].append("A-warmup")
             return resp
 
-        # A2. KNN tidak perlu siram → matikan pompa
+        # A2. KNN tidak perlu siram
         if not knn_result["needs_watering"]:
             resp["pending_updates"].update(
                 pump_status=False, last_watered_minute=current_total_minutes,
@@ -655,13 +666,9 @@ async def _evaluate_smart_watering_async(
             resp["decision_path"].append("A2-knn-off")
             return resp
 
-        # A3. Label hujan — matikan pompa KECUALI sedang di window wajib siram
-        # [FIX v11.4.0] Di window pagi/sore, penyiraman wajib tidak bisa
-        # dihentikan oleh label hujan. Hujan di Ambon terlalu sering
-        # muncul sebagai false positive.
+        # A3. Label hujan — abaikan di window wajib siram
         if knn_result["label"] in ("Hujan_Aktif", "Hujan_Prediksi"):
             if in_window:
-                # Window wajib siram → abaikan label hujan, biarkan pompa jalan
                 resp["reason"] = (
                     f"KNN: {knn_result['label']} — DIABAIKAN karena jam siram wajib {window_label}. "
                     f"Pompa tetap ON."
@@ -671,7 +678,6 @@ async def _evaluate_smart_watering_async(
                          knn_result['label'], window_label)
                 return resp
             else:
-                # Di luar window → matikan pompa
                 resp["pending_updates"].update(
                     pump_status=False, last_watered_minute=current_total_minutes,
                     last_watered_ts=datetime.now().isoformat(),
@@ -682,16 +688,13 @@ async def _evaluate_smart_watering_async(
                 resp["decision_path"].append("A3-rain-off")
                 return resp
 
-        # Pompa masih jalan normal
         resp["reason"] = f"KNN: {knn_result['label']} ({knn_result['confidence']}%) — pompa jalan"
         resp["decision_path"].append("A4-running")
         return resp
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Pompa OFF — evaluasi apakah perlu dinyalakan
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Pompa OFF — evaluasi nyalakan ─────────────────────────────────────────
 
-    # B2. Darurat malam — tanah sangat kering di luar window
+    # B2. Darurat malam
     if (not in_window and soil_moisture <= CFG.CRITICAL_DRY
             and knn_result["label"] not in ("Hujan_Aktif", "Hujan_Prediksi")):
         now_ts = datetime.now().isoformat()
@@ -706,21 +709,17 @@ async def _evaluate_smart_watering_async(
         return resp
 
     # B3. KNN tidak perlu siram
-    # [FIX v11.4.0] Jika sedang di window wajib siram DAN tanah kering DAN
-    # label hujan adalah false positive → paksa siram tetap jalan.
     if not knn_result["needs_watering"]:
         rain_label = knn_result["label"] in ("Hujan_Aktif", "Hujan_Prediksi")
         rain_score = knn_result.get("computed_features", {}).get("rain_score", 0.0)
 
         if in_window and rain_label and soil_moisture < 50.0 and rain_score < CFG.RAIN_SCORE_THRESHOLD:
-            # Hujan false positive di window siram + tanah masih kering → lanjut ke B6
             log.info(
                 "[B3] Rain false positive diabaikan di window %s. "
                 "soil=%.1f%%, rain_score=%.1f < %.0f. Lanjut siram.",
                 window_label, soil_moisture, rain_score, CFG.RAIN_SCORE_THRESHOLD
             )
             resp["decision_path"].append("B3-rain-false-positive-override")
-            # Jatuh ke B6 di bawah
         else:
             resp["blocked_reason"] = (
                 f"KNN: {knn_result['label']} ({knn_result['confidence']}%) — tidak perlu siram"
@@ -739,7 +738,7 @@ async def _evaluate_smart_watering_async(
         resp["decision_path"].append("B4-low-confidence")
         return resp
 
-    # B5. Cooldown belum selesai
+    # B5. Cooldown
     elapsed_cd = _elapsed_minutes(current_total_minutes, state.get("last_watered_minute"))
     if elapsed_cd < CFG.COOLDOWN_MINUTES:
         resp["blocked_reason"] = (
@@ -759,7 +758,7 @@ async def _evaluate_smart_watering_async(
     resp["reason"] = (
         f"KNN [{window_label or 'darurat'}]: label={knn_result['label']}, "
         f"conf={knn_result['confidence']}%, "
-        f"rain={knn_result.get('computed_features', {}).get('rain_score', 0)}"
+        f"rain_score={knn_result.get('computed_features', {}).get('rain_score', 0)}"
     )
     resp["decision_path"].append("B6-knn-final")
     return resp
@@ -785,7 +784,6 @@ def _run_test_classify(req: TestKNNRequest) -> dict:
     rain_score = knn.get("computed_features", {}).get("rain_score", 0.0)
 
     if not knn["needs_watering"]:
-        # [FIX v11.4.0] Jika di window siram, tanah kering, rain false positive → tetap siram
         if (in_window and rain_label
                 and req.soil_moisture < 50.0
                 and rain_score < CFG.RAIN_SCORE_THRESHOLD):
@@ -801,7 +799,6 @@ def _run_test_classify(req: TestKNNRequest) -> dict:
             decision_path.append("B3-knn-no-water")
     elif rain_label:
         if in_window:
-            # Di window wajib → siram tetap jalan
             aksi_pompa = "on"
             alasan = (
                 f"KNN: {knn['label']} — DIABAIKAN (window wajib {wlbl}). "
@@ -859,12 +856,12 @@ def _run_test_classify(req: TestKNNRequest) -> dict:
         "jam_siram_aktif" : in_window,
         "window_label"    : wlbl or "di luar jam siram",
         "computed_features": knn["computed_features"],
-        # [FIX] Tambahkan info debug rain_score
         "rain_debug"      : {
-            "rain_score"     : rain_score,
-            "threshold"      : CFG.RAIN_SCORE_THRESHOLD,
-            "is_credible"    : rain_score >= CFG.RAIN_SCORE_THRESHOLD,
-            "label_is_rain"  : rain_label,
+            "rain_score"    : rain_score,
+            "threshold"     : CFG.RAIN_SCORE_THRESHOLD,
+            "is_credible"   : rain_score >= CFG.RAIN_SCORE_THRESHOLD,
+            "label_is_rain" : rain_label,
+            "note"          : "rain_score dipakai untuk logika keputusan, BUKAN input model KNN",
         },
     }
 
@@ -906,7 +903,6 @@ SKENARIO_PRESET = [
     {"id":"S11","nama":"Malam — kering, luar jadwal","ekspektasi":"Siram_Nanti",
      "keterangan":"Jam 23:00, tunggu pagi.",
      "data":{"soil_moisture":18,"temperature":24,"air_humidity":60,"hour":23,"soil_prev":20,"temp_prev":25,"rh_prev":59}},
-    # [FIX v11.4.0] S12 diperbarui: RH 95% saja tidak cukup tanpa soil naik drastis
     {"id":"S12","nama":"Pagi — RH tinggi TAPI soil kering (Ambon normal)","ekspektasi":"Siram_Segera",
      "keterangan":"RH 95% normal di Ambon. Soil kering 22% + soil tidak naik → bukan hujan → siram.",
      "data":{"soil_moisture":22,"temperature":27,"air_humidity":95,"hour":6,"soil_prev":23,"temp_prev":28,"rh_prev":93}},
@@ -989,6 +985,8 @@ async def reset_test_state():
             "message": "State + OVR berhasil direset. Siap pengujian ulang.",
             "ovr_timeout_seconds": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
             "rain_score_threshold": CFG.RAIN_SCORE_THRESHOLD,
+            "model_features": CFG.MODEL_FEATURES,
+            "model_features_count": len(CFG.MODEL_FEATURES),
             "reset_fields": list(reset_fields.keys()),
             "timestamp": datetime.now().isoformat(),
         }
@@ -1006,13 +1004,20 @@ def root():
         "model_ready": knn_model is not None,
         "ovr_timeout_seconds": CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
         "rain_score_threshold": CFG.RAIN_SCORE_THRESHOLD,
+        "model_features": CFG.MODEL_FEATURES,
+        "model_features_count": len(CFG.MODEL_FEATURES),
         "fix_notes": {
+            "v11.5.0": [
+                "FIX UTAMA: hapus rain_score & rain_score_prev dari input model (10→8 fitur)",
+                "Model KNN v4 Ambon hanya butuh 8 fitur: soil_moisture, temperature, air_humidity,",
+                "hour_sin, hour_cos, soil_trend, evapotranspiration, is_hot",
+                "rain_score tetap dihitung untuk logika keputusan watering engine & debug",
+                "Tambah validasi n_features saat startup untuk deteksi mismatch lebih awal",
+            ],
             "v11.4.0": [
                 "rain_score threshold dinaikkan untuk iklim lembab tropis Ambon",
-                "RH >= 97 → +40 poin (sebelumnya RH >= 92 → +50 poin)",
-                "rain_score < 60 → label hujan diabaikan (override ke label berbasis soil)",
+                "RH >= 97 → +40 poin, rain_score < 60 → label hujan diabaikan",
                 "window wajib pagi/sore: penyiraman tetap jalan walau rain_score tinggi",
-                "skenario S12 diperbarui: RH 95% tanpa kenaikan soil = SIRAM bukan hujan",
             ]
         },
         "endpoints_test": {
@@ -1264,6 +1269,8 @@ async def get_status():
             "needs_watering"       : list(CFG.NEEDS_WATERING_LABELS),
             "ovr_expire_seconds"   : CFG.MANUAL_OVERRIDE_EXPIRE_SECONDS,
             "rain_score_threshold" : CFG.RAIN_SCORE_THRESHOLD,
+            "model_features"       : CFG.MODEL_FEATURES,
+            "model_features_count" : len(CFG.MODEL_FEATURES),
         },
         "model_info": {
             "algorithm": model_meta.get("algorithm"), "version": model_meta.get("version"),
@@ -1294,4 +1301,3 @@ async def get_history(
             return []
     records = await loop.run_in_executor(_executor, _fetch)
     return {"total": len(records), "pump_only": pump_only, "records": records}
-#fff
