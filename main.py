@@ -33,7 +33,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 VALID_API_KEY  = os.environ.get("API_KEY", "")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-APP_VERSION = "11.6.1"
+APP_VERSION = "11.7.0"
 # ═══════════════════════════════════════════════════════════════════════════════
 # v11.6.0 — Logika auto simpel: wajib siram di window pagi & sore, titik.
 #
@@ -186,6 +186,9 @@ _STATE_DEFAULTS = {
     "last_sensor_soil"    : None,
     "session_count_today" : 0,
     "session_count_date"  : None,
+    # Guard: catat window mana yang sudah disiram hari ini
+    # Format: "YYYY-MM-DD:morning" atau "YYYY-MM-DD:evening"
+    "last_watered_window" : None,
 }
 
 _rt_cache: dict = {"data": None, "timestamp": 0.0}
@@ -592,11 +595,12 @@ async def _evaluate_smart_watering_async(
     state, current_total_minutes,
 ) -> dict:
     """
-    Logika simpel v11.6.1:
-    - Jam window pagi (05-07) atau sore (16-18) → pompa WAJIB ON
+    Logika simpel v11.7.0:
+    - Jam window pagi (05-07) atau sore (16-18) → pompa WAJIB ON, 1x per window per hari
     - Di luar window → pompa OFF
+    - Pompa sudah ON → biarkan jalan sampai MAX_PUMP_DURATION_MINUTES, lalu OFF
+    - Guard session: pagi/sore masing-masing hanya 1 sesi per hari → cegah nyala-mati berulang
     - Manual override tetap bisa menghentikan pompa sementara
-    - KNN tetap jalan untuk klasifikasi & logging sensor
     """
     resp = {
         "action"           : None,
@@ -636,20 +640,22 @@ async def _evaluate_smart_watering_async(
             _rt_cache["data"]      = None
             _rt_cache["timestamp"] = 0.0
 
-    async def _add_pump_on_updates(upd: dict):
+    async def _add_pump_on_updates(upd: dict, wlbl: str):
         async with _daily_safety_lock:
             _daily_counter_reset_if_new_day()
             _daily_safety["watering_count"] += 1
             cnt = _daily_safety["watering_count"]
         upd["session_count_today"] = cnt
         upd["session_count_date"]  = date.today().isoformat()
+        # Catat window yang sudah disiram hari ini
+        upd["last_watered_window"] = f"{date.today().isoformat()}:{wlbl}"
 
     # ── Pompa sedang ON ───────────────────────────────────────────────────────
     if state["pump_status"]:
         elapsed_sec = _elapsed_seconds_real(state.get("pump_start_ts"))
         max_sec     = CFG.MAX_PUMP_DURATION_MINUTES * 60
 
-        # A1. Durasi maksimum tercapai → matikan
+        # A1. Durasi maksimum tercapai → matikan, catat selesai
         if elapsed_sec >= max_sec:
             resp["pending_updates"].update(
                 pump_status=False, last_watered_minute=current_total_minutes,
@@ -657,48 +663,56 @@ async def _evaluate_smart_watering_async(
                 pump_start_ts=None, pump_start_minute=None, missed_session=False,
             )
             resp["action"] = "off"
-            resp["reason"] = f"Auto-stop: durasi {elapsed_sec:.0f}s ({CFG.MAX_PUMP_DURATION_MINUTES} menit)"
+            resp["reason"] = f"Selesai: pompa jalan {elapsed_sec:.0f}s ({CFG.MAX_PUMP_DURATION_MINUTES} menit penuh)"
             resp["decision_path"].append("A1-max-duration")
+            log.info("[AUTO] Pompa OFF — selesai %ds window %s", int(elapsed_sec), window_label or "?")
             return resp
 
-        # A2. Masih di window → biarkan jalan
-        if in_window:
-            resp["reason"] = f"Jam siram wajib {window_label} — pompa jalan ({elapsed_sec:.0f}s)"
-            resp["decision_path"].append("A2-window-running")
-            return resp
-
-        # A3. Keluar window → matikan pompa
-        resp["pending_updates"].update(
-            pump_status=False, last_watered_minute=current_total_minutes,
-            last_watered_ts=datetime.now().isoformat(),
-            pump_start_ts=None, pump_start_minute=None, missed_session=False,
+        # A2. Masih dalam durasi → biarkan jalan, jangan ubah apapun
+        resp["reason"] = (
+            f"Pompa jalan {elapsed_sec:.0f}s / {max_sec}s"
+            + (f" — window {window_label}" if in_window else " — menyelesaikan sesi")
         )
-        resp["action"] = "off"
-        resp["reason"] = f"Jam siram selesai — pompa OFF (keluar window {window_label or 'pagi/sore'})"
-        resp["decision_path"].append("A3-window-ended")
+        resp["decision_path"].append("A2-pump-running")
         return resp
 
-    # ── Pompa OFF — evaluasi nyalakan ─────────────────────────────────────────
+    # ── Pompa OFF — evaluasi apakah perlu nyala ───────────────────────────────
 
     # B2. Di luar window → tidak siram
     if not in_window:
-        resp["blocked_reason"] = f"Di luar jam siram wajib (pagi 05-07 / sore 16-18)"
+        resp["blocked_reason"] = "Di luar jam siram wajib (pagi 05-07 / sore 16-18)"
         resp["decision_path"].append("B2-outside-window")
         return resp
 
-    # B3. Di dalam window → POMPA ON WAJIB
+    # B3. Cek apakah window ini SUDAH disiram hari ini
+    # Format key: "YYYY-MM-DD:pagi" atau "YYYY-MM-DD:sore"
+    today_window_key = f"{date.today().isoformat()}:{window_label}"
+    last_watered_window = state.get("last_watered_window") or ""
+    if last_watered_window == today_window_key:
+        resp["blocked_reason"] = (
+            f"Sesi {window_label} hari ini sudah selesai — tunggu window berikutnya"
+        )
+        resp["decision_path"].append("B3-session-done-today")
+        log.info("[AUTO] Skip — sesi %s hari ini sudah selesai.", window_label)
+        return resp
+
+    # B4. Di dalam window dan belum disiram → POMPA ON
     now_ts = datetime.now().isoformat()
     pump_u = dict(
         pump_status=True,
         pump_start_minute=current_total_minutes,
         pump_start_ts=now_ts,
     )
-    await _add_pump_on_updates(pump_u)
+    await _add_pump_on_updates(pump_u, window_label)
     resp["pending_updates"].update(pump_u)
     resp["action"] = "on"
-    resp["reason"] = f"Jam siram wajib {window_label} (jam ESP32: {hour:02d}:{minute:02d}) — pompa ON"
-    resp["decision_path"].append("B3-mandatory-window-on")
-    log.info("[AUTO] Pompa ON — window wajib %s jam %02d:%02d (ESP32)", window_label, hour, minute)
+    resp["reason"] = (
+        f"Jam siram wajib {window_label} (ESP32: {hour:02d}:{minute:02d}) — pompa ON, "
+        f"akan berjalan {CFG.MAX_PUMP_DURATION_MINUTES} menit"
+    )
+    resp["decision_path"].append("B4-mandatory-window-on")
+    log.info("[AUTO] Pompa ON — window %s jam %02d:%02d, durasi %dm",
+             window_label, hour, minute, CFG.MAX_PUMP_DURATION_MINUTES)
     return resp
 
 
@@ -913,6 +927,7 @@ async def reset_test_state():
         "session_count_today": 0, "last_sensor_ts": None, "last_sensor_soil": None,
         "last_soil_moisture": None, "last_temperature": None,
         "last_air_humidity": None, "last_rain_score": None, "missed_session": False,
+        "last_watered_window": None,  # reset session guard
     }
     try:
         await loop.run_in_executor(_executor, lambda: _sb_update_state_sync(**reset_fields))
@@ -932,6 +947,130 @@ async def reset_test_state():
         raise HTTPException(status_code=503, detail=f"Gagal reset state: {e}")
 
 
+
+
+
+
+
+class TestFireRequest(BaseModel):
+    soil_moisture  : float           = Field(..., ge=0, le=100)
+    temperature    : float           = Field(..., ge=0, le=60)
+    air_humidity   : float           = Field(..., ge=0, le=100)
+    hour           : int             = Field(..., ge=0, le=23,
+                                            description="Jam inject bebas — tidak harus jam sekarang")
+    minute         : int             = Field(default=0, ge=0, le=59)
+    soil_prev      : Optional[float] = Field(default=None, ge=0, le=100)
+    temp_prev      : Optional[float] = Field(default=None, ge=0, le=60)
+    rh_prev        : Optional[float] = Field(default=None, ge=0, le=100)
+    label_skenario : Optional[str]   = Field(default=None)
+    ekspektasi     : Optional[str]   = Field(default=None)
+
+
+@app.post("/test-knn/fire", tags=["🧪 Pengujian KNN"],
+          summary="🔥 FIRE — inject jam bebas, pompa BENAR-BENAR nyala via Supabase",
+          description=(
+              "Berbeda dengan `/test-knn` (simulasi saja), endpoint ini:\n"
+              "- **Pompa benar-benar dinyalakan** via Supabase\n"
+              "- **Jam bisa di-inject bebas** — kirim `hour:6` walau sekarang siang\n"
+              "- **Tulis ke sensor_readings** seperti data ESP32 asli\n\n"
+              "Cocok untuk menguji pompa fisik tanpa menunggu jam pagi/sore."
+          ),
+          dependencies=[Depends(verify_api_key)])
+async def test_knn_fire(req: TestFireRequest, bg_tasks: BackgroundTasks):
+    injected_hour     = req.hour
+    injected_minute   = req.minute
+    current_total_min = _total_minutes(injected_hour, injected_minute)
+    in_window, window_label = _in_watering_window(injected_hour)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row_id    = str(uuid.uuid4())
+
+    # KNN classify
+    knn_result = classify(
+        soil=req.soil_moisture, temp=req.temperature,
+        rh=req.air_humidity,    hour=injected_hour,
+        soil_prev=req.soil_prev, temp_prev=req.temp_prev, rh_prev=req.rh_prev,
+    )
+
+    # Ambil state terkini (fresh dari Supabase)
+    loop  = asyncio.get_event_loop()
+    state = await loop.run_in_executor(_executor, _sb_get_state_sync)
+
+    # Jalankan watering engine dengan jam yang di-inject
+    smart_eval   = await _evaluate_smart_watering_async(
+        knn_result=knn_result,
+        hour=injected_hour, minute=injected_minute,
+        soil_moisture=req.soil_moisture, air_humidity=req.air_humidity,
+        temperature=req.temperature,
+        state=state,
+        current_total_minutes=current_total_min,
+    )
+    final_action = smart_eval.get("action")
+    pump_status_logged = (final_action == "on") if final_action is not None else state["pump_status"]
+
+    # Tulis ke Supabase
+    sensor_updates = dict(
+        last_label=knn_result["label"], last_updated=timestamp,
+        last_soil_moisture=req.soil_moisture, last_temperature=req.temperature,
+        last_air_humidity=req.air_humidity,
+        last_rain_score=knn_result["computed_features"]["rain_score"],
+        last_sensor_ts=datetime.now().isoformat(), last_sensor_soil=req.soil_moisture,
+    )
+    pending     = smart_eval.get("pending_updates", {})
+    all_updates = {**sensor_updates, **pending}
+
+    optimistic = {**(_rt_cache["data"] or {}), **all_updates}
+    _rt_cache["data"]      = _normalize_state(optimistic)
+    _rt_cache["timestamp"] = time.monotonic()
+
+    sensor_row = {
+        "id": row_id, "timestamp": datetime.now().isoformat(),
+        "soil_moisture": req.soil_moisture, "temperature": req.temperature,
+        "air_humidity": req.air_humidity, "label": knn_result["label"],
+        "confidence": knn_result["confidence"], "needs_watering": knn_result["needs_watering"],
+        "description": knn_result.get("description", ""),
+        "probabilities": knn_result["probabilities"],
+        "computed_features": knn_result.get("computed_features", {}),
+        "pump_status": pump_status_logged, "mode": "test-fire",
+        "hour": injected_hour, "minute": injected_minute,
+    }
+
+    try:
+        await loop.run_in_executor(_executor, lambda: _sb_update_state_sync(**all_updates))
+        asyncio.ensure_future(
+            loop.run_in_executor(_executor, lambda: _sb_insert_sensor_sync(sensor_row))
+        )
+    except Exception as e:
+        log.error("test-fire write gagal: %s", e)
+        raise HTTPException(status_code=503, detail=f"Gagal menulis ke Supabase: {e}")
+
+    new_state = _get_state()
+    cocok = (knn_result["label"] == req.ekspektasi) if req.ekspektasi else None
+
+    return {
+        "mode"          : "🔥 TEST-FIRE — pompa benar-benar dikendalikan",
+        "skenario"      : req.label_skenario or "Manual fire",
+        "jam_injected"  : f"{injected_hour:02d}:{injected_minute:02d}",
+        "jam_server"    : datetime.now().strftime("%H:%M:%S"),
+        "in_window"     : in_window,
+        "window_label"  : window_label or "di luar jam siram",
+        "knn_result"    : knn_result,
+        "pump_action"   : final_action,
+        "pump_status"   : new_state["pump_status"],
+        "reason"        : smart_eval.get("reason") or smart_eval.get("blocked_reason"),
+        "decision_path" : smart_eval.get("decision_path", []),
+        "validasi_label": {
+            "ekspektasi": req.ekspektasi, "hasil": knn_result["label"],
+            "cocok": cocok,
+            "status": ("✅ BENAR" if cocok else "❌ MELESET") if cocok is not None else "—",
+        } if req.ekspektasi else None,
+        "peringatan": (
+            None if in_window
+            else f"⚠️  hour={injected_hour} di luar window pagi(05-07)/sore(16-18) — pompa tidak nyala"
+        ),
+        "session_guard" : new_state.get("last_watered_window"),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS PRODUKSI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -945,18 +1084,17 @@ def root():
         "model_features": CFG.MODEL_FEATURES,
         "model_features_count": len(CFG.MODEL_FEATURES),
         "fix_notes": {
-            "v11.5.0": [
-                "FIX UTAMA: hapus rain_score & rain_score_prev dari input model (10→8 fitur)",
-                "Model KNN v4 Ambon hanya butuh 8 fitur: soil_moisture, temperature, air_humidity,",
-                "hour_sin, hour_cos, soil_trend, evapotranspiration, is_hot",
-                "rain_score tetap dihitung untuk logika keputusan watering engine & debug",
-                "Tambah validasi n_features saat startup untuk deteksi mismatch lebih awal",
+            "v11.7.0": [
+                "FIX KRITIS: pompa tidak lagi nyala-mati-nyala berulang",
+                "Guard session: pagi & sore masing-masing hanya 1x per hari (last_watered_window)",
+                "Pompa ON → biarkan jalan penuh MAX_PUMP_DURATION_MINUTES → OFF → tidak nyala lagi",
+                "Hapus A3-window-ended: pompa tidak dimatikan karena keluar window, hanya karena durasi",
+                "FIX 404: endpoint /test-knn/fire ditambahkan",
             ],
-            "v11.4.0": [
-                "rain_score threshold dinaikkan untuk iklim lembab tropis Ambon",
-                "RH >= 97 → +40 poin, rain_score < 60 → label hujan diabaikan",
-                "window wajib pagi/sore: penyiraman tetap jalan walau rain_score tinggi",
-            ]
+            "v11.6.1": [
+                "Waktu 100% dari ESP32, tidak ada fallback server",
+                "Logika auto: window pagi 05-07 dan sore 16-18 wajib siram",
+            ],
         },
         "endpoints_test": {
             "GET  /test-knn/skenario": "12 skenario preset siap uji",
