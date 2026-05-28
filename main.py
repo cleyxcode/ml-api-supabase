@@ -748,20 +748,144 @@ def test_knn_batch(payload: BatchPayload, x_api_key: str = Header(...)):
 def test_reset(x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
-    state.pump_status      = False
-    state.pump_start_ts    = None
-    state.manual_override  = False
+    state.pump_status       = False
+    state.pump_start_ts     = None
+    state.manual_override   = False
     state.last_watered_pagi = None
     state.last_watered_sore = None
-    state.mode             = "auto"
+    state.mode              = "auto"
 
-    # Matikan relay via ESP32 (dilakukan lewat pump_status=False pada poll berikutnya)
     save_state()
 
     return {
-        "message"      : "State berhasil direset",
-        "pump_status"  : state.pump_status,
-        "mode"         : state.mode,
+        "message"          : "State berhasil direset",
+        "pump_status"      : state.pump_status,
+        "mode"             : state.mode,
         "last_watered_pagi": None,
         "last_watered_sore": None,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /test-knn/fire
+# ─────────────────────────────────────────────────────────────────────────────
+# Berbeda dengan /test-knn (simulasi saja), endpoint ini:
+#   - Inject jam bebas (tidak perlu tunggu jam pagi/sore sungguhan)
+#   - Jalankan KNN dengan data yang dikirim
+#   - Jika jam masuk window DAN KNN = LABEL_SIRAM → pompa BENAR-BENAR nyala
+#   - Data ditulis ke Supabase (sensor_readings + system_state)
+#
+# Cocok untuk testing pompa dari meja tanpa harus tunggu jam 05:00 / 16:00.
+# ─────────────────────────────────────────────────────────────────────────────
+class FirePayload(BaseModel):
+    soil_moisture  : float
+    temperature    : float
+    air_humidity   : float
+    hour           : int              = Field(..., ge=0, le=23)
+    minute         : Optional[int]   = Field(0,   ge=0, le=59)
+    soil_prev      : Optional[float] = None
+    temp_prev      : Optional[float] = None
+    rh_prev        : Optional[float] = None
+    label_skenario : Optional[str]   = None
+    ekspektasi     : Optional[str]   = None
+
+@app.post("/test-knn/fire")
+def test_knn_fire(payload: FirePayload, x_api_key: str = Header(...)):
+    check_api_key(x_api_key)
+
+    # Cek timeout pompa lebih dulu
+    check_pump_timeout()
+
+    # Jalankan KNN dengan data yang dikirim
+    knn_result = run_knn(
+        soil      = payload.soil_moisture,
+        temp      = payload.temperature,
+        rh        = payload.air_humidity,
+        hour      = payload.hour,
+        soil_prev = payload.soil_prev,
+        temp_prev = payload.temp_prev,
+        rh_prev   = payload.rh_prev,
+    )
+
+    label  = knn_result["label"]
+    conf   = round(knn_result["confidence"] * 100, 1)
+    window = get_window_name(payload.hour)
+    today  = date.today()
+
+    pump_action = None
+    reason      = ""
+    peringatan  = None
+
+    if window is None:
+        # Jam di luar window — pompa tidak nyala meski FIRE
+        peringatan  = (f"⚠ Jam {payload.hour:02d}:xx di luar window pagi/sore. "
+                       f"Pompa tidak nyala. Gunakan hour 5-6 (pagi) atau 16-17 (sore).")
+        reason = f"[FIRE] Di luar window | KNN: {label} ({conf}%)"
+
+    elif label not in LABEL_SIRAM:
+        # KNN memutuskan tidak perlu siram
+        peringatan  = (f"⚠ KNN memutuskan TIDAK SIRAM ({label} {conf}%). "
+                       f"Pompa tidak nyala. Coba kondisi tanah lebih kering.")
+        reason = f"[FIRE] KNN={label} → tidak siram | window={window}"
+
+    else:
+        # Window benar + KNN siram → nyalakan pompa sungguhan
+        set_pump(True, f"[FIRE] KNN={label} ({conf}%) window={window}")
+        mark_watered(window, today)
+        pump_action = "on"
+        reason = (f"[FIRE] KNN={label} ({conf}%) | window={window} "
+                  f"| pompa ON {PUMP_DURATION_MINUTES} menit")
+
+    # Simpan ke sensor_readings
+    try:
+        supabase.table("sensor_readings").insert({
+            "soil_moisture"  : payload.soil_moisture,
+            "temperature"    : payload.temperature,
+            "air_humidity"   : payload.air_humidity,
+            "hour"           : payload.hour,
+            "window"         : window,
+            "knn_label"      : label,
+            "knn_confidence" : knn_result["confidence"],
+            "pump_action"    : pump_action,
+            "pump_status"    : state.pump_status,
+            "mode"           : state.mode,
+            "reason"         : reason,
+            "recorded_at"    : datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception as e:
+        log.warning(f"[FIRE] Gagal simpan DB: {e}")
+
+    # Update state di Supabase
+    state.last_knn_label = label
+    state.last_knn_conf  = knn_result["confidence"]
+    save_state()
+
+    # Tentukan status keputusan untuk response
+    if pump_action == "on":
+        keputusan = f"✅ POMPA ON — KNN={label} ({conf}%) | {PUMP_DURATION_MINUTES} menit"
+    elif window and label not in LABEL_SIRAM:
+        keputusan = f"⛔ TIDAK SIRAM — KNN={label} ({conf}%) | window={window}"
+    else:
+        keputusan = f"⏰ DI LUAR JADWAL — jam {payload.hour:02d}:xx | KNN={label} ({conf}%)"
+
+    benar = (label == payload.ekspektasi) if payload.ekspektasi else None
+
+    return {
+        "label_skenario" : payload.label_skenario,
+        "classification" : {
+            "label"          : label,
+            "confidence"     : knn_result["confidence"],
+            "confidence_pct" : conf,
+        },
+        "window"         : window,
+        "keputusan"      : keputusan,
+        "pump_status"    : state.pump_status,
+        "pump_action"    : pump_action,
+        "pump_remaining_min": pump_remaining_minutes(),
+        "ekspektasi"     : payload.ekspektasi,
+        "benar"          : benar,
+        "peringatan"     : peringatan,
+        "reason"         : reason,
+        "features"       : knn_result.get("features", {}),
+        "catatan"        : "[FIRE] Data ditulis ke Supabase. Pompa nyala sungguhan jika syarat terpenuhi.",
     }
