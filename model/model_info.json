@@ -1,7 +1,7 @@
 {
   "algorithm": "K-Nearest Neighbor",
-  "version": "4.0",
-  "best_k": 9,
+  "version": "5.0",
+  "best_k": 5,
   "features": [
     "soil_moisture",
     "temperature",
@@ -24,9 +24,14 @@
     "Siram_Segera",
     "Siram_Prioritas"
   ],
-  "accuracy": 0.963,
-  "cv_accuracy": 0.9685,
-  "cv_std": 0.004835,
+  "skip_labels": [
+    "Siram_Nanti",
+    "Optimal",
+    "Basah"
+  ],
+  "accuracy_test": 0.9655,
+  "accuracy_cv": 0.9675,
+  "cv_std": 0.002179,
   "metric": "euclidean",
   "weights": "distance",
   "n_samples": 10000,
@@ -34,32 +39,28 @@
   "n_test": 2000,
   "scaler": "StandardScaler",
   "lokasi": "Ambon, Maluku (WIT = UTC+9)",
-  "jam_siram": {
-    "pagi": "05:00-07:59 WIT",
-    "sore": "16:00-18:59 WIT"
-  },
   "catatan": [
-    "Hujan_Aktif dan Hujan_Prediksi DIHAPUS — user handle manual",
-    "RH tinggi 80-97% adalah NORMAL di Ambon, bukan indikator hujan",
-    "rain_score DIHAPUS dari fitur — tidak relevan untuk Ambon",
-    "Mode AUTO: wajib siram pagi & sore, tidak bisa diblokir KNN",
-    "Jika hujan: user matikan pompa manual via /control off"
+    "v5.0: Hujan_Aktif & Hujan_Prediksi DIHAPUS",
+    "Window pagi/sore tidak hardcode — KNN yang memutuskan",
+    "RH 80-97% adalah NORMAL di Ambon",
+    "ET pakai VPD-based (konsisten antara training & BE)",
+    "Bundle: knn_bundle.pkl berisi model + scaler"
   ],
   "label_desc": {
     "Siram_Segera": "Tanah kering + jam siram → POMPA ON",
-    "Siram_Prioritas": "Sangat kering + panas ekstrem + jam siram → POMPA ON DARURAT",
-    "Siram_Nanti": "Tanah kering tapi luar jam siram → TUNGGU JADWAL",
-    "Optimal": "Kelembaban tanah ideal → TAHAN",
-    "Basah": "Tanah jenuh air → JANGAN SIRAM"
+    "Siram_Prioritas": "Sangat kering + panas + jam siram → POMPA ON DARURAT",
+    "Siram_Nanti": "Tanah kering tapi luar jam siram → TUNGGU",
+    "Optimal": "Kelembaban ideal → TAHAN",
+    "Basah": "Tanah jenuh → JANGAN SIRAM"
   },
   "feature_desc": {
-    "soil_moisture": "Kelembaban tanah sensor kapasitif 0-100%",
-    "temperature": "Suhu udara DHT22 degC",
-    "air_humidity": "Kelembaban udara DHT22 0-100% (normal Ambon: 80-97%)",
-    "hour_sin": "sin(jam x 2pi/24) dari RTC ESP32",
-    "hour_cos": "cos(jam x 2pi/24) dari RTC ESP32",
+    "soil_moisture": "Kelembaban tanah 0-100%",
+    "temperature": "Suhu udara °C",
+    "air_humidity": "Kelembaban udara 0-100% (normal Ambon: 80-97%)",
+    "hour_sin": "sin(jam × 2π/24)",
+    "hour_cos": "cos(jam × 2π/24)",
     "soil_trend": "Delta soil_moisture (sekarang - sebelumnya)",
-    "evapotranspiration": "Estimasi laju penguapan VPD-based 0-100",
-    "is_hot": "Flag 1 jika suhu >= 34C"
+    "evapotranspiration": "Laju penguapan VPD-based 0-100",
+    "is_hot": "Flag 1 jika suhu ≥ 34°C"
   }
 }
