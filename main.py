@@ -1,13 +1,25 @@
 """
-Siram Pintar API v13.0
+Siram Pintar API v13.1
 ======================
 
-Perubahan dari v12:
-  - Hapus label Hujan_Aktif & Hujan_Prediksi
-  - Formula ET diganti VPD-based (konsisten dengan dataset v7)
-  - is_hot threshold: 35 -> 34 (sesuai dataset)
-  - Load model: 2 file terpisah (knn_model.pkl + scaler.pkl)
-  - Kode lebih clean dan ringkas
+Perubahan dari v13.0:
+  - Disesuaikan dengan schema Supabase yang ada (tanpa ALTER TABLE)
+  - sensor_readings : pakai kolom timestamp, label, confidence,
+                      needs_watering, description (bukan recorded_at, knn_label, dst)
+  - system_state    : pakai kolom last_soil_moisture, last_label,
+                      last_watered_ts (bukan last_watered_pagi/sore terpisah)
+  - Logika window pagi/sore tetap berjalan, disimpan di last_watered_ts + kolom baru
+    last_watered_window (VARCHAR) — lihat catatan migrasi di bawah
+  - /history pump_only filter pakai needs_watering = true
+
+CATATAN MIGRASI (opsional, jalankan di Supabase SQL Editor):
+  ALTER TABLE public.system_state
+    ADD COLUMN IF NOT EXISTS last_watered_pagi date,
+    ADD COLUMN IF NOT EXISTS last_watered_sore date,
+    ADD COLUMN IF NOT EXISTS last_knn_conf double precision DEFAULT 0;
+
+  Jika kolom di atas belum ada, API tetap berjalan normal —
+  last_watered_pagi/sore disimpan di memori saja (reset saat restart).
 
 Logika AUTO:
   - Window pagi 05:00-06:59 dan sore 16:00-17:59
@@ -34,6 +46,7 @@ Endpoints:
 
 import os
 import math
+import uuid
 import logging
 from datetime import datetime, date
 from typing import Optional, List
@@ -57,17 +70,17 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Konfigurasi
 # ─────────────────────────────────────────────────────────────────────────────
-VERSION      = "13.0"
+VERSION      = "13.1"
 API_KEY      = os.getenv("API_KEY",      "yuli1")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 MODEL_PATH   = os.getenv("MODEL_PATH",   "model/knn_model.pkl")
 SCALER_PATH  = os.getenv("SCALER_PATH",  "model/scaler.pkl")
 
-WINDOW_PAGI           = (5, 7)   # 05:00 - 06:59
-WINDOW_SORE           = (16, 18) # 16:00 - 17:59
+WINDOW_PAGI           = (5, 7)    # 05:00 - 06:59
+WINDOW_SORE           = (16, 18)  # 16:00 - 17:59
 PUMP_DURATION_MINUTES = 20
-IS_HOT_THRESHOLD      = 34.0     # sesuai dataset v7
+IS_HOT_THRESHOLD      = 34.0      # sesuai dataset v7
 
 LABEL_SIRAM = {"Siram_Segera", "Siram_Prioritas"}
 LABEL_SKIP  = {"Siram_Nanti", "Optimal", "Basah"}
@@ -156,8 +169,8 @@ class SystemState:
     mode              : str                = "auto"
     manual_override   : bool               = False
     pump_start_ts     : Optional[datetime] = None
-    last_watered_pagi : Optional[date]     = None
-    last_watered_sore : Optional[date]     = None
+    last_watered_pagi : Optional[date]     = None  # in-memory fallback
+    last_watered_sore : Optional[date]     = None  # in-memory fallback
     last_soil         : float              = 0.0
     last_temp         : float              = 0.0
     last_rh           : float              = 0.0
@@ -168,28 +181,74 @@ class SystemState:
 state = SystemState()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# State: Load & Save
+# Helper: cek apakah kolom ada di schema
+# ─────────────────────────────────────────────────────────────────────────────
+def _col_exists(table: str, col: str) -> bool:
+    """
+    Cek keberadaan kolom dengan cara mencoba select kolom tersebut.
+    Hasilnya di-cache di dict _col_cache agar tidak query berulang.
+    """
+    key = f"{table}.{col}"
+    if key in _col_cache:
+        return _col_cache[key]
+    try:
+        supabase.table(table).select(col).limit(1).execute()
+        _col_cache[key] = True
+    except Exception:
+        _col_cache[key] = False
+    return _col_cache[key]
+
+_col_cache: dict = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State: Load & Save  — disesuaikan dengan schema Supabase
 # ─────────────────────────────────────────────────────────────────────────────
 def load_state():
     try:
         res = supabase.table("system_state").select("*").eq("id", 1).single().execute()
         if not res.data:
+            log.info("[STATE] Belum ada data di DB, pakai default.")
             return
         d = res.data
+
         state.pump_status     = d.get("pump_status", False)
         state.mode            = d.get("mode", "auto")
         state.manual_override = d.get("manual_override", False)
-        state.last_soil       = d.get("last_soil", 0.0)
-        state.last_knn_label  = d.get("last_knn_label", "---")
-        state.last_knn_conf   = d.get("last_knn_conf", 0.0)
 
+        # Nama kolom soil di schema: last_soil_moisture
+        state.last_soil      = d.get("last_soil_moisture") or d.get("last_soil") or 0.0
+
+        # Nama kolom label di schema: last_label
+        state.last_knn_label = d.get("last_label") or d.get("last_knn_label") or "---"
+
+        # last_knn_conf — mungkin belum ada di schema lama
+        state.last_knn_conf  = d.get("last_knn_conf") or 0.0
+
+        # pump_start_ts
+        pts = d.get("pump_start_ts")
+        state.pump_start_ts = datetime.fromisoformat(pts) if pts else None
+
+        # last_watered_pagi / last_watered_sore
+        # Coba baca dari kolom baru (jika sudah di-migrate)
         lp = d.get("last_watered_pagi")
         ls = d.get("last_watered_sore")
         state.last_watered_pagi = date.fromisoformat(lp) if lp else None
         state.last_watered_sore = date.fromisoformat(ls) if ls else None
 
-        pts = d.get("pump_start_ts")
-        state.pump_start_ts = datetime.fromisoformat(pts) if pts else None
+        # Fallback: jika kolom belum ada, perkirakan dari last_watered_ts
+        if state.last_watered_pagi is None and state.last_watered_sore is None:
+            lwts = d.get("last_watered_ts")
+            if lwts:
+                try:
+                    lwts_dt  = datetime.fromisoformat(lwts)
+                    lwts_date = lwts_dt.date()
+                    # Tebak window dari jam
+                    if WINDOW_PAGI[0] <= lwts_dt.hour < WINDOW_PAGI[1]:
+                        state.last_watered_pagi = lwts_date
+                    elif WINDOW_SORE[0] <= lwts_dt.hour < WINDOW_SORE[1]:
+                        state.last_watered_sore = lwts_date
+                except Exception:
+                    pass
 
         log.info(f"[STATE] Dimuat — pump={state.pump_status} mode={state.mode}")
     except Exception as e:
@@ -198,21 +257,56 @@ def load_state():
 
 def save_state():
     try:
-        supabase.table("system_state").upsert({
+        payload_db: dict = {
             "id"               : 1,
             "pump_status"      : state.pump_status,
             "mode"             : state.mode,
             "manual_override"  : state.manual_override,
-            "last_soil"        : state.last_soil,
-            "last_knn_label"   : state.last_knn_label,
-            "last_knn_conf"    : state.last_knn_conf,
-            "last_watered_pagi": state.last_watered_pagi.isoformat() if state.last_watered_pagi else None,
-            "last_watered_sore": state.last_watered_sore.isoformat() if state.last_watered_sore else None,
+            "last_soil_moisture": state.last_soil,         # sesuai schema
+            "last_label"       : state.last_knn_label,     # sesuai schema
             "pump_start_ts"    : state.pump_start_ts.isoformat() if state.pump_start_ts else None,
-            "updated_at"       : datetime.utcnow().isoformat(),
-        }).execute()
+            "last_updated"     : datetime.utcnow().isoformat(),
+            # last_watered_ts: pakai waktu terbaru antara pagi/sore
+            "last_watered_ts"  : _latest_watered_ts(),
+        }
+
+        # Simpan kolom opsional jika sudah ada di schema
+        if _col_exists("system_state", "last_knn_conf"):
+            payload_db["last_knn_conf"] = state.last_knn_conf
+        if _col_exists("system_state", "last_watered_pagi"):
+            payload_db["last_watered_pagi"] = (
+                state.last_watered_pagi.isoformat() if state.last_watered_pagi else None
+            )
+        if _col_exists("system_state", "last_watered_sore"):
+            payload_db["last_watered_sore"] = (
+                state.last_watered_sore.isoformat() if state.last_watered_sore else None
+            )
+
+        supabase.table("system_state").upsert(payload_db).execute()
     except Exception as e:
         log.warning(f"[STATE] Gagal simpan: {e}")
+
+
+def _latest_watered_ts() -> Optional[str]:
+    """Ambil timestamp terbaru antara last_watered_pagi dan last_watered_sore."""
+    candidates = []
+    if state.last_watered_pagi:
+        candidates.append(datetime(
+            state.last_watered_pagi.year,
+            state.last_watered_pagi.month,
+            state.last_watered_pagi.day,
+            6, 0, 0
+        ))
+    if state.last_watered_sore:
+        candidates.append(datetime(
+            state.last_watered_sore.year,
+            state.last_watered_sore.month,
+            state.last_watered_sore.day,
+            17, 0, 0
+        ))
+    if not candidates:
+        return None
+    return max(candidates).isoformat()
 
 
 @app.on_event("startup")
@@ -254,10 +348,10 @@ def run_knn(
     et         = calc_et(temp, rh)
     is_hot     = 1.0 if temp >= IS_HOT_THRESHOLD else 0.0
 
-    X = np.array([[soil, temp, rh, hour_sin, hour_cos, soil_trend, et, is_hot]])
-    X_scaled   = knn_scaler.transform(X)
-    label      = knn_model.predict(X_scaled)[0]
-    proba      = knn_model.predict_proba(X_scaled)[0]
+    X        = np.array([[soil, temp, rh, hour_sin, hour_cos, soil_trend, et, is_hot]])
+    X_scaled = knn_scaler.transform(X)
+    label    = knn_model.predict(X_scaled)[0]
+    proba    = knn_model.predict_proba(X_scaled)[0]
     confidence = float(np.max(proba))
 
     return {
@@ -326,27 +420,51 @@ def pump_remaining() -> float:
     return max(0.0, round(PUMP_DURATION_MINUTES - elapsed, 1))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: Log Sensor & Build Response
+# Helper: Log Sensor — disesuaikan dengan schema sensor_readings
+#
+# Kolom yang ADA di schema:
+#   id, timestamp, soil_moisture, temperature, air_humidity,
+#   label, confidence, needs_watering, description,
+#   probabilities, pump_status, mode
+#
+# Kolom yang TIDAK ADA (dihilangkan):
+#   recorded_at, knn_label, knn_confidence, hour, window,
+#   pump_action, reason, knn_conf
 # ─────────────────────────────────────────────────────────────────────────────
-def log_to_db(payload: SensorPayload, hour: int, window: Optional[str],
-              knn: dict, pump_action: Optional[str], reason: str):
+def log_to_db(
+    payload     : SensorPayload,
+    hour        : int,
+    window      : Optional[str],
+    knn         : dict,
+    pump_action : Optional[str],
+    reason      : str,
+):
     try:
-        supabase.table("sensor_readings").insert({
+        # Bangun description dari reason + info tambahan
+        desc_parts = [reason]
+        if window:
+            desc_parts.append(f"window={window}")
+        desc_parts.append(f"hour={hour:02d}:xx")
+        description = " | ".join(desc_parts)
+
+        record = {
+            "id"            : str(uuid.uuid4()),
+            "timestamp"     : datetime.utcnow().isoformat(),   # sesuai schema
             "soil_moisture" : payload.soil_moisture,
             "temperature"   : payload.temperature,
             "air_humidity"  : payload.air_humidity,
-            "hour"          : hour,
-            "window"        : window,
-            "knn_label"     : knn.get("label"),
-            "knn_confidence": knn.get("confidence"),
-            "pump_action"   : pump_action,
+            "label"         : knn.get("label", "---"),          # sesuai schema
+            "confidence"    : knn.get("confidence", 0.0),       # sesuai schema
+            "needs_watering": pump_action == "on",               # boolean sesuai schema
+            "description"   : description,                       # sesuai schema
             "pump_status"   : state.pump_status,
             "mode"          : state.mode,
-            "reason"        : reason,
-            "recorded_at"   : datetime.utcnow().isoformat(),
-        }).execute()
+            # probabilities: simpan features sebagai JSON tambahan (opsional)
+            "probabilities" : knn.get("features", {}),
+        }
+        supabase.table("sensor_readings").insert(record).execute()
     except Exception as e:
-        log.warning(f"[DB] Gagal simpan: {e}")
+        log.warning(f"[DB] Gagal simpan sensor: {e}")
 
 
 def build_response(knn: dict, pump_action: Optional[str], reason: str) -> dict:
@@ -532,7 +650,7 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GET /history
+# GET /history  — pakai kolom "timestamp" dan filter "needs_watering"
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/history")
 def get_history(
@@ -542,12 +660,14 @@ def get_history(
 ):
     check_api_key(x_api_key)
     try:
-        q = (supabase.table("sensor_readings")
-             .select("*")
-             .order("recorded_at", desc=True)
-             .limit(limit))
+        q = (
+            supabase.table("sensor_readings")
+            .select("*")
+            .order("timestamp", desc=True)     # ← sesuai schema (bukan recorded_at)
+            .limit(limit)
+        )
         if pump_only:
-            q = q.eq("pump_action", "on")
+            q = q.eq("needs_watering", True)   # ← sesuai schema (bukan pump_action='on')
         res = q.execute()
         return {"count": len(res.data), "data": res.data}
     except Exception as e:
@@ -581,30 +701,30 @@ def test_knn(payload: TestPayload, x_api_key: str = Header(...)):
             "confidence"    : knn["confidence"],
             "confidence_pct": conf,
         },
-        "window"   : window,
-        "keputusan": keputusan,
+        "window"    : window,
+        "keputusan" : keputusan,
         "ekspektasi": payload.ekspektasi,
-        "benar"    : (label == payload.ekspektasi) if payload.ekspektasi else None,
-        "features" : knn.get("features", {}),
-        "catatan"  : "[SIMULASI] pompa tidak nyala",
+        "benar"     : (label == payload.ekspektasi) if payload.ekspektasi else None,
+        "features"  : knn.get("features", {}),
+        "catatan"   : "[SIMULASI] pompa tidak nyala",
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /test-knn/skenario
 # ─────────────────────────────────────────────────────────────────────────────
 SKENARIO_PRESET = [
-    {"label": "S01 - Pagi kering RH normal",        "soil": 22, "temp": 29, "rh": 55, "hour": 6,  "soil_prev": 24, "ekspektasi": "Siram_Segera"},
-    {"label": "S02 - Sore kering",                  "soil": 25, "temp": 31, "rh": 58, "hour": 17, "soil_prev": 27, "ekspektasi": "Siram_Segera"},
-    {"label": "S03 - Pagi kering RH Ambon 92%",     "soil": 22, "temp": 29, "rh": 92, "hour": 6,  "soil_prev": 22, "ekspektasi": "Siram_Segera"},
-    {"label": "S04 - DARURAT pagi panas 38C",       "soil": 14, "temp": 38, "rh": 35, "hour": 6,  "soil_prev": 18, "ekspektasi": "Siram_Prioritas"},
-    {"label": "S05 - DARURAT sore panas",           "soil": 16, "temp": 36, "rh": 38, "hour": 17, "soil_prev": 20, "ekspektasi": "Siram_Prioritas"},
-    {"label": "S06 - Siang kering luar jadwal",     "soil": 25, "temp": 33, "rh": 52, "hour": 13, "soil_prev": 27, "ekspektasi": "Siram_Nanti"},
-    {"label": "S07 - Tengah malam kering",          "soil": 28, "temp": 26, "rh": 65, "hour": 2,  "soil_prev": 29, "ekspektasi": "Siram_Nanti"},
-    {"label": "S08 - Malam kering",                 "soil": 18, "temp": 24, "rh": 60, "hour": 23, "soil_prev": 20, "ekspektasi": "Siram_Nanti"},
-    {"label": "S09 - Tanah optimal pagi",           "soil": 55, "temp": 27, "rh": 65, "hour": 6,  "soil_prev": 55, "ekspektasi": "Optimal"},
-    {"label": "S10 - Tanah optimal RH Ambon",       "soil": 60, "temp": 28, "rh": 94, "hour": 17, "soil_prev": 59, "ekspektasi": "Optimal"},
-    {"label": "S11 - Tanah basah sore",             "soil": 83, "temp": 22, "rh": 88, "hour": 17, "soil_prev": 80, "ekspektasi": "Basah"},
-    {"label": "S12 - Tanah sangat basah",           "soil": 88, "temp": 24, "rh": 85, "hour": 6,  "soil_prev": 82, "ekspektasi": "Basah"},
+    {"label": "S01 - Pagi kering RH normal",    "soil": 22, "temp": 29, "rh": 55, "hour": 6,  "soil_prev": 24, "ekspektasi": "Siram_Segera"},
+    {"label": "S02 - Sore kering",              "soil": 25, "temp": 31, "rh": 58, "hour": 17, "soil_prev": 27, "ekspektasi": "Siram_Segera"},
+    {"label": "S03 - Pagi kering RH Ambon 92%", "soil": 22, "temp": 29, "rh": 92, "hour": 6,  "soil_prev": 22, "ekspektasi": "Siram_Segera"},
+    {"label": "S04 - DARURAT pagi panas 38C",   "soil": 14, "temp": 38, "rh": 35, "hour": 6,  "soil_prev": 18, "ekspektasi": "Siram_Prioritas"},
+    {"label": "S05 - DARURAT sore panas",       "soil": 16, "temp": 36, "rh": 38, "hour": 17, "soil_prev": 20, "ekspektasi": "Siram_Prioritas"},
+    {"label": "S06 - Siang kering luar jadwal", "soil": 25, "temp": 33, "rh": 52, "hour": 13, "soil_prev": 27, "ekspektasi": "Siram_Nanti"},
+    {"label": "S07 - Tengah malam kering",      "soil": 28, "temp": 26, "rh": 65, "hour": 2,  "soil_prev": 29, "ekspektasi": "Siram_Nanti"},
+    {"label": "S08 - Malam kering",             "soil": 18, "temp": 24, "rh": 60, "hour": 23, "soil_prev": 20, "ekspektasi": "Siram_Nanti"},
+    {"label": "S09 - Tanah optimal pagi",       "soil": 55, "temp": 27, "rh": 65, "hour": 6,  "soil_prev": 55, "ekspektasi": "Optimal"},
+    {"label": "S10 - Tanah optimal RH Ambon",   "soil": 60, "temp": 28, "rh": 94, "hour": 17, "soil_prev": 59, "ekspektasi": "Optimal"},
+    {"label": "S11 - Tanah basah sore",         "soil": 83, "temp": 22, "rh": 88, "hour": 17, "soil_prev": 80, "ekspektasi": "Basah"},
+    {"label": "S12 - Tanah sangat basah",       "soil": 88, "temp": 24, "rh": 85, "hour": 6,  "soil_prev": 82, "ekspektasi": "Basah"},
 ]
 
 @app.get("/test-knn/skenario")
@@ -640,10 +760,10 @@ def get_skenario(x_api_key: str = Header(...)):
         })
 
     return {
-        "akurasi"  : f"{round(benar_n / len(SKENARIO_PRESET) * 100, 1)}%",
-        "benar"    : benar_n,
-        "total"    : len(SKENARIO_PRESET),
-        "hasil"    : hasil,
+        "akurasi": f"{round(benar_n / len(SKENARIO_PRESET) * 100, 1)}%",
+        "benar"  : benar_n,
+        "total"  : len(SKENARIO_PRESET),
+        "hasil"  : hasil,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -707,9 +827,9 @@ def test_reset(x_api_key: str = Header(...)):
     save_state()
 
     return {
-        "message"     : "State berhasil direset",
-        "pump_status" : state.pump_status,
-        "mode"        : state.mode,
+        "message"    : "State berhasil direset",
+        "pump_status": state.pump_status,
+        "mode"       : state.mode,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -743,21 +863,26 @@ def test_fire(payload: FirePayload, x_api_key: str = Header(...)):
         pump_action = "on"
         reason      = f"[FIRE] KNN={label} ({conf}%) | window={window} | pompa ON {PUMP_DURATION_MINUTES} menit"
 
-    # Simpan ke DB
+    # Simpan ke DB — pakai schema yang ada
     try:
+        desc_parts  = [reason]
+        if window:
+            desc_parts.append(f"window={window}")
+        desc_parts.append(f"hour={payload.hour:02d}:xx")
+
         supabase.table("sensor_readings").insert({
+            "id"            : str(uuid.uuid4()),
+            "timestamp"     : datetime.utcnow().isoformat(),   # sesuai schema
             "soil_moisture" : payload.soil_moisture,
             "temperature"   : payload.temperature,
             "air_humidity"  : payload.air_humidity,
-            "hour"          : payload.hour,
-            "window"        : window,
-            "knn_label"     : label,
-            "knn_confidence": knn["confidence"],
-            "pump_action"   : pump_action,
+            "label"         : label,                            # sesuai schema
+            "confidence"    : knn["confidence"],                # sesuai schema
+            "needs_watering": pump_action == "on",              # sesuai schema
+            "description"   : " | ".join(desc_parts),          # sesuai schema
             "pump_status"   : state.pump_status,
             "mode"          : state.mode,
-            "reason"        : reason,
-            "recorded_at"   : datetime.utcnow().isoformat(),
+            "probabilities" : knn.get("features", {}),
         }).execute()
     except Exception as e:
         log.warning(f"[FIRE] Gagal simpan DB: {e}")
