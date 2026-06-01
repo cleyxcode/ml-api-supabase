@@ -1,8 +1,8 @@
 {
-  "algorithm": "K-Nearest Neighbor",
-  "version": "5.0",
-  "best_k": 5,
-  "features": [
+  "versi": "7.0",
+  "algoritma": "K-Nearest Neighbor",
+  "K": 5,
+  "fitur": [
     "soil_moisture",
     "temperature",
     "air_humidity",
@@ -12,55 +12,24 @@
     "evapotranspiration",
     "is_hot"
   ],
-  "n_features": 8,
-  "labels": [
+  "label": [
     "Siram_Segera",
     "Siram_Prioritas",
     "Siram_Nanti",
     "Optimal",
     "Basah"
   ],
-  "needs_watering_labels": [
+  "label_pompa_on": [
     "Siram_Segera",
     "Siram_Prioritas"
   ],
-  "skip_labels": [
+  "label_pompa_off": [
     "Siram_Nanti",
     "Optimal",
     "Basah"
   ],
-  "accuracy_test": 0.9655,
-  "accuracy_cv": 0.9675,
-  "cv_std": 0.002179,
-  "metric": "euclidean",
-  "weights": "distance",
-  "n_samples": 10000,
-  "n_train": 8000,
-  "n_test": 2000,
-  "scaler": "StandardScaler",
-  "lokasi": "Ambon, Maluku (WIT = UTC+9)",
-  "catatan": [
-    "v5.0: Hujan_Aktif & Hujan_Prediksi DIHAPUS",
-    "Window pagi/sore tidak hardcode — KNN yang memutuskan",
-    "RH 80-97% adalah NORMAL di Ambon",
-    "ET pakai VPD-based (konsisten antara training & BE)",
-    "Bundle: knn_bundle.pkl berisi model + scaler"
-  ],
-  "label_desc": {
-    "Siram_Segera": "Tanah kering + jam siram → POMPA ON",
-    "Siram_Prioritas": "Sangat kering + panas + jam siram → POMPA ON DARURAT",
-    "Siram_Nanti": "Tanah kering tapi luar jam siram → TUNGGU",
-    "Optimal": "Kelembaban ideal → TAHAN",
-    "Basah": "Tanah jenuh → JANGAN SIRAM"
-  },
-  "feature_desc": {
-    "soil_moisture": "Kelembaban tanah 0-100%",
-    "temperature": "Suhu udara °C",
-    "air_humidity": "Kelembaban udara 0-100% (normal Ambon: 80-97%)",
-    "hour_sin": "sin(jam × 2π/24)",
-    "hour_cos": "cos(jam × 2π/24)",
-    "soil_trend": "Delta soil_moisture (sekarang - sebelumnya)",
-    "evapotranspiration": "Laju penguapan VPD-based 0-100",
-    "is_hot": "Flag 1 jika suhu ≥ 34°C"
-  }
+  "akurasi_test": 0.9655,
+  "akurasi_cv": 0.9675,
+  "total_data": 10000,
+  "lokasi": "Ambon, Maluku"
 }
