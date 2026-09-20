@@ -1,14 +1,10 @@
 """
-Siram Pintar API v13.2
+Siram Pintar API v13.3
 ======================
-Perubahan dari v13.1:
-  - Tambah mode TEST (selain auto & manual)
-  - Mode TEST: cek soil sekali
-      < 35%  → pompa ON 30 detik → OFF → pindah MANUAL
-      35-65% → pompa OFF → kembali AUTO
-      > 65%  → pompa OFF → kembali AUTO
-  - AUTO di-pause saat mode TEST aktif
-  - Data test tersimpan ke Supabase dengan mode='test'
+Perubahan dari v13.2:
+  - Fix: guard test_status done/lembab/basah agar pompa tidak restart
+  - Fix: check_test_timeout hanya pindah ke MANUAL (tidak AUTO)
+  - Fix: mode TEST lebih stabil, tidak bolak-balik
 """
 
 import os
@@ -34,7 +30,7 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Konfigurasi
 # ─────────────────────────────────────────────────────────────────────────────
-VERSION      = "13.2"
+VERSION      = "13.3"
 API_KEY      = os.getenv("API_KEY",      "yuli1")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -44,15 +40,14 @@ SCALER_PATH  = os.getenv("SCALER_PATH",  "model/scaler.pkl")
 WINDOW_PAGI           = (5, 7)
 WINDOW_SORE           = (16, 18)
 PUMP_DURATION_MINUTES = 20
-TEST_PUMP_SECONDS     = 30       # durasi pompa mode TEST
+TEST_PUMP_SECONDS     = 30
 IS_HOT_THRESHOLD      = 34.0
 
 LABEL_SIRAM = {"Siram_Segera", "Siram_Prioritas"}
 LABEL_SKIP  = {"Siram_Nanti", "Optimal", "Basah"}
 
-# Threshold mode TEST
-TEST_DRY_MAX  = 35.0   # < 35%  → kering → siram
-TEST_WET_MIN  = 65.0   # > 65%  → basah  → selesai
+TEST_DRY_MAX = 35.0
+TEST_WET_MIN = 65.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Supabase & Model
@@ -97,11 +92,11 @@ class SensorPayload(BaseModel):
     minute        : Optional[int] = Field(None, ge=0, le=59)
 
 class ControlPayload(BaseModel):
-    action : str   # "on" / "off"
-    mode   : str   # "manual" / "auto" / "test"
+    action : str
+    mode   : str
 
 class TestModePayload(BaseModel):
-    active: bool   # true = aktifkan test, false = batalkan
+    active: bool
 
 class TestPayload(BaseModel):
     soil_moisture  : float
@@ -129,7 +124,7 @@ class FirePayload(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 class SystemState:
     pump_status       : bool               = False
-    mode              : str                = "auto"   # "auto" | "manual" | "test"
+    mode              : str                = "auto"
     manual_override   : bool               = False
     pump_start_ts     : Optional[datetime] = None
     last_watered_pagi : Optional[date]     = None
@@ -140,9 +135,8 @@ class SystemState:
     last_hour         : int                = 0
     last_knn_label    : str                = "---"
     last_knn_conf     : float              = 0.0
-    # State khusus TEST
     test_active       : bool               = False
-    test_status       : str                = ""       # "pumping" | "done" | "lembab" | "basah"
+    test_status       : str                = ""
     test_pump_start   : Optional[datetime] = None
     test_result       : str                = ""
 
@@ -186,11 +180,10 @@ def load_state():
         state.last_watered_pagi = date.fromisoformat(lp) if lp else None
         state.last_watered_sore = date.fromisoformat(ls) if ls else None
         # Reset test state saat startup
-        state.test_active   = False
-        state.test_status   = ""
-        state.test_result   = ""
+        state.test_active     = False
+        state.test_status     = ""
+        state.test_result     = ""
         state.test_pump_start = None
-        # Jika mode test tersimpan di DB, kembalikan ke auto saat restart
         if state.mode == "test":
             state.mode = "auto"
         log.info(f"[STATE] Dimuat — pump={state.pump_status} mode={state.mode}")
@@ -333,7 +326,7 @@ def check_test_timeout():
         state.test_active     = False
         state.test_status     = "done"
         state.test_result     = "Pompa ON 30 detik selesai → pindah MANUAL"
-        state.mode            = "manual"
+        state.mode            = "manual"   # tetap MANUAL, bukan AUTO
         state.manual_override = True
         state.test_pump_start = None
         save_state()
@@ -354,7 +347,7 @@ def test_pump_remaining() -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 def log_to_db(payload, hour, window, knn, pump_action, reason):
     try:
-        desc_parts  = [reason]
+        desc_parts = [reason]
         if window: desc_parts.append(f"window={window}")
         desc_parts.append(f"hour={hour:02d}:xx")
         record = {
@@ -387,9 +380,9 @@ def build_response(knn, pump_action, reason) -> dict:
             "manual_override"   : state.manual_override,
         },
         "test_info": {
-            "active"           : state.test_active,
-            "status"           : state.test_status,
-            "result"           : state.test_result,
+            "active"            : state.test_active,
+            "status"            : state.test_status,
+            "result"            : state.test_result,
             "pump_remaining_sec": test_pump_remaining(),
         },
         "features": knn.get("features", {}),
@@ -413,12 +406,12 @@ def health_check():
             "pump_remaining_sec": test_pump_remaining(),
         },
         "logic": {
-            "window_pagi"     : f"{WINDOW_PAGI[0]:02d}:00 - {WINDOW_PAGI[1]:02d}:00",
-            "window_sore"     : f"{WINDOW_SORE[0]:02d}:00 - {WINDOW_SORE[1]:02d}:00",
-            "pump_duration"   : f"{PUMP_DURATION_MINUTES} menit",
-            "test_dry_max"    : f"< {TEST_DRY_MAX}% → siram 30 detik → MANUAL",
-            "test_lembab"     : f"{TEST_DRY_MAX}-{TEST_WET_MIN}% → skip → AUTO",
-            "test_wet_min"    : f"> {TEST_WET_MIN}% → selesai → AUTO",
+            "window_pagi"  : f"{WINDOW_PAGI[0]:02d}:00 - {WINDOW_PAGI[1]:02d}:00",
+            "window_sore"  : f"{WINDOW_SORE[0]:02d}:00 - {WINDOW_SORE[1]:02d}:00",
+            "pump_duration": f"{PUMP_DURATION_MINUTES} menit",
+            "test_dry_max" : f"< {TEST_DRY_MAX}% → siram 30 detik → MANUAL",
+            "test_lembab"  : f"{TEST_DRY_MAX}-{TEST_WET_MIN}% → skip → AUTO",
+            "test_wet_min" : f"> {TEST_WET_MIN}% → selesai → AUTO",
         },
     }
 
@@ -476,7 +469,7 @@ def get_pump_status(x_api_key: str = Header(...)):
 def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
     check_timeout()
-    check_test_timeout()   # cek timeout pompa TEST tiap ada data masuk
+    check_test_timeout()
 
     hour      = payload.hour if payload.hour is not None else datetime.utcnow().hour
     today     = date.today()
@@ -503,15 +496,21 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
     if state.mode == "test":
         soil = payload.soil_moisture
 
+        # Guard 1: pompa sedang ON → tunggu timeout, jangan restart
         if state.test_active and state.pump_status:
-            # Pompa sedang ON dalam test, tunggu timeout (check_test_timeout sudah dipanggil)
             reason = f"[TEST] Pompa ON — sisa {test_pump_remaining():.0f} detik"
             log_to_db(payload, hour, None, knn, "on", reason)
             save_state()
             return build_response(knn, "on", reason)
 
+        # Guard 2: test sudah selesai → jangan mulai lagi, tunggu mode berganti
+        if state.test_status in ("done", "lembab", "basah"):
+            reason = f"[TEST] Sudah selesai ({state.test_status}), menunggu mode berganti"
+            log_to_db(payload, hour, None, knn, None, reason)
+            save_state()
+            return build_response(knn, None, reason)
+
         if soil < TEST_DRY_MAX:
-            # KERING → pompa ON 30 detik
             state.test_active     = True
             state.test_status     = "pumping"
             state.test_result     = f"Tanah kering ({soil:.1f}%) → pompa ON 30 detik"
@@ -521,21 +520,19 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
             reason = f"[TEST] Kering {soil:.1f}% < {TEST_DRY_MAX}% → pompa ON 30 detik → akan pindah MANUAL"
 
         elif soil <= TEST_WET_MIN:
-            # LEMBAB → pompa OFF, kembali AUTO
-            state.test_active  = False
-            state.test_status  = "lembab"
-            state.test_result  = f"Tanah cukup lembab ({soil:.1f}%) → tidak perlu siram"
-            state.mode         = "auto"
+            state.test_active     = False
+            state.test_status     = "lembab"
+            state.test_result     = f"Tanah cukup lembab ({soil:.1f}%) → tidak perlu siram"
+            state.mode            = "auto"
             state.manual_override = False
             set_pump(False, f"[TEST] Lembab {soil:.1f}%")
             reason = f"[TEST] Lembab {soil:.1f}% ({TEST_DRY_MAX}-{TEST_WET_MIN}%) → cukup → kembali AUTO"
 
         else:
-            # BASAH → pompa OFF, kembali AUTO
-            state.test_active  = False
-            state.test_status  = "basah"
-            state.test_result  = f"Tanah basah ({soil:.1f}%) → test selesai"
-            state.mode         = "auto"
+            state.test_active     = False
+            state.test_status     = "basah"
+            state.test_result     = f"Tanah basah ({soil:.1f}%) → test selesai"
+            state.mode            = "auto"
             state.manual_override = False
             set_pump(False, f"[TEST] Basah {soil:.1f}%")
             reason = f"[TEST] Basah {soil:.1f}% > {TEST_WET_MIN}% → selesai → kembali AUTO"
@@ -588,7 +585,7 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
     return build_response(knn, pump_action, reason)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /control  (auto | manual | test)
+# POST /control
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/control")
 def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
@@ -599,11 +596,9 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
     if payload.mode not in ("manual", "auto", "test"):
         raise HTTPException(status_code=400, detail="mode harus 'manual', 'auto', atau 'test'")
 
-    prev_mode  = state.mode
     state.mode = payload.mode
 
     if payload.mode == "test":
-        # Reset state test
         state.test_active     = True
         state.test_status     = "waiting"
         state.test_result     = "Menunggu data sensor..."
@@ -616,6 +611,7 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         state.manual_override = True
         state.test_active     = False
         state.test_status     = ""
+        state.test_result     = ""
         set_pump(payload.action == "on", f"MANUAL — {payload.action}")
 
     else:  # auto
@@ -632,9 +628,9 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         "manual_override": state.manual_override,
         "message"        : f"Mode → {state.mode} | Pompa {'ON' if state.pump_status else 'OFF'}",
         "test_info": {
-            "active" : state.test_active,
-            "status" : state.test_status,
-            "result" : state.test_result,
+            "active": state.test_active,
+            "status": state.test_status,
+            "result": state.test_result,
         },
     }
 
@@ -646,7 +642,7 @@ def get_history(
     x_api_key : str  = Header(...),
     limit     : int  = Query(20, ge=1, le=100),
     pump_only : bool = Query(False),
-    mode      : Optional[str] = Query(None),  # filter by mode: auto|manual|test
+    mode      : Optional[str] = Query(None),
 ):
     check_api_key(x_api_key)
     try:
@@ -667,7 +663,7 @@ def get_history(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # POST /test-knn, GET /test-knn/skenario, POST /test-knn/batch
-# POST /test-knn/reset, POST /test-knn/fire  (sama seperti v13.1)
+# POST /test-knn/reset, POST /test-knn/fire
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/test-knn")
 def test_knn(payload: TestPayload, x_api_key: str = Header(...)):
