@@ -1,10 +1,10 @@
 """
-Siram Pintar API v13.3
+Siram Pintar API v13.4
 ======================
-Perubahan dari v13.2:
-  - Fix: guard test_status done/lembab/basah agar pompa tidak restart
-  - Fix: check_test_timeout hanya pindah ke MANUAL (tidak AUTO)
-  - Fix: mode TEST lebih stabil, tidak bolak-balik
+Perubahan dari v13.3:
+  - Fix: setelah test done → mode MANUAL, pompa OFF, tidak bolak-balik
+  - Fix: guard tambahan cegah test restart saat transisi state
+  - Fix: /control reset test_status saat masuk mode baru
 """
 
 import os
@@ -21,16 +21,10 @@ from pydantic import BaseModel, Field
 import joblib
 from supabase import create_client, Client
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Konfigurasi
-# ─────────────────────────────────────────────────────────────────────────────
-VERSION      = "13.3"
+VERSION      = "13.4"
 API_KEY      = os.getenv("API_KEY",      "yuli1")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -49,9 +43,6 @@ LABEL_SKIP  = {"Siram_Nanti", "Optimal", "Basah"}
 TEST_DRY_MAX = 35.0
 TEST_WET_MIN = 65.0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Supabase & Model
-# ─────────────────────────────────────────────────────────────────────────────
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 knn_model  = None
@@ -70,9 +61,6 @@ try:
 except Exception as e:
     log.warning(f"[MODEL] Gagal muat model: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI
-# ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Siram Pintar API", version=VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -81,9 +69,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Schema
-# ─────────────────────────────────────────────────────────────────────────────
 class SensorPayload(BaseModel):
     soil_moisture : float = Field(..., ge=0,   le=100)
     temperature   : float = Field(..., ge=-10, le=60)
@@ -94,9 +79,6 @@ class SensorPayload(BaseModel):
 class ControlPayload(BaseModel):
     action : str
     mode   : str
-
-class TestModePayload(BaseModel):
-    active: bool
 
 class TestPayload(BaseModel):
     soil_moisture  : float
@@ -119,9 +101,6 @@ class FirePayload(BaseModel):
     label_skenario : Optional[str]   = None
     ekspektasi     : Optional[str]   = None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# State
-# ─────────────────────────────────────────────────────────────────────────────
 class SystemState:
     pump_status       : bool               = False
     mode              : str                = "auto"
@@ -142,9 +121,6 @@ class SystemState:
 
 state = SystemState()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper kolom cache
-# ─────────────────────────────────────────────────────────────────────────────
 _col_cache: dict = {}
 
 def _col_exists(table: str, col: str) -> bool:
@@ -158,9 +134,6 @@ def _col_exists(table: str, col: str) -> bool:
         _col_cache[key] = False
     return _col_cache[key]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# State Load & Save
-# ─────────────────────────────────────────────────────────────────────────────
 def load_state():
     try:
         res = supabase.table("system_state").select("*").eq("id", 1).single().execute()
@@ -190,7 +163,6 @@ def load_state():
     except Exception as e:
         log.warning(f"[STATE] Gagal muat: {e}")
 
-
 def save_state():
     try:
         payload_db: dict = {
@@ -218,7 +190,6 @@ def save_state():
     except Exception as e:
         log.warning(f"[STATE] Gagal simpan: {e}")
 
-
 def _latest_watered_ts() -> Optional[str]:
     candidates = []
     if state.last_watered_pagi:
@@ -235,25 +206,17 @@ def _latest_watered_ts() -> Optional[str]:
         ))
     return max(candidates).isoformat() if candidates else None
 
-
 @app.on_event("startup")
 def on_startup():
     load_state()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper Auth
-# ─────────────────────────────────────────────────────────────────────────────
 def check_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="API key salah")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper KNN
-# ─────────────────────────────────────────────────────────────────────────────
 def calc_et(temp: float, rh: float) -> float:
     vpd = (1 - rh / 100) * 0.6108 * math.exp(17.27 * temp / (temp + 237.3))
     return round(min(max(vpd * 15, 0), 100), 2)
-
 
 def run_knn(soil, temp, rh, hour, soil_prev=None) -> dict:
     if knn_model is None or knn_scaler is None:
@@ -284,9 +247,6 @@ def run_knn(soil, temp, rh, hour, soil_prev=None) -> dict:
         },
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper Pompa & Window
-# ─────────────────────────────────────────────────────────────────────────────
 def get_window(hour: int) -> Optional[str]:
     if WINDOW_PAGI[0] <= hour < WINDOW_PAGI[1]: return "pagi"
     if WINDOW_SORE[0] <= hour < WINDOW_SORE[1]: return "sore"
@@ -316,7 +276,6 @@ def check_timeout():
         save_state()
 
 def check_test_timeout():
-    """Cek apakah pompa TEST sudah 30 detik → matikan → pindah MANUAL"""
     if not state.test_active: return
     if not state.pump_status: return
     if state.test_pump_start is None: return
@@ -326,11 +285,11 @@ def check_test_timeout():
         state.test_active     = False
         state.test_status     = "done"
         state.test_result     = "Pompa ON 30 detik selesai → pindah MANUAL"
-        state.mode            = "manual"   # tetap MANUAL, bukan AUTO
+        state.mode            = "manual"
         state.manual_override = True
         state.test_pump_start = None
         save_state()
-        log.info("[TEST] Selesai 30 detik → mode MANUAL")
+        log.info("[TEST] Selesai 30 detik → mode MANUAL, pompa OFF")
 
 def pump_remaining() -> float:
     if not state.pump_status or state.pump_start_ts is None: return 0.0
@@ -342,9 +301,6 @@ def test_pump_remaining() -> float:
     elapsed = (datetime.utcnow() - state.test_pump_start).total_seconds()
     return max(0.0, round(TEST_PUMP_SECONDS - elapsed, 1))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper Log DB
-# ─────────────────────────────────────────────────────────────────────────────
 def log_to_db(payload, hour, window, knn, pump_action, reason):
     try:
         desc_parts = [reason]
@@ -388,9 +344,6 @@ def build_response(knn, pump_action, reason) -> dict:
         "features": knn.get("features", {}),
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def health_check():
     return {
@@ -405,19 +358,8 @@ def health_check():
             "result"            : state.test_result,
             "pump_remaining_sec": test_pump_remaining(),
         },
-        "logic": {
-            "window_pagi"  : f"{WINDOW_PAGI[0]:02d}:00 - {WINDOW_PAGI[1]:02d}:00",
-            "window_sore"  : f"{WINDOW_SORE[0]:02d}:00 - {WINDOW_SORE[1]:02d}:00",
-            "pump_duration": f"{PUMP_DURATION_MINUTES} menit",
-            "test_dry_max" : f"< {TEST_DRY_MAX}% → siram 30 detik → MANUAL",
-            "test_lembab"  : f"{TEST_DRY_MAX}-{TEST_WET_MIN}% → skip → AUTO",
-            "test_wet_min" : f"> {TEST_WET_MIN}% → selesai → AUTO",
-        },
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /status
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/status")
 def get_status(x_api_key: str = Header(...)):
     check_api_key(x_api_key)
@@ -441,9 +383,6 @@ def get_status(x_api_key: str = Header(...)):
         },
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /pump-status
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/pump-status")
 def get_pump_status(x_api_key: str = Header(...)):
     check_api_key(x_api_key)
@@ -462,9 +401,6 @@ def get_pump_status(x_api_key: str = Header(...)):
         },
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# POST /sensor
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/sensor")
 def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
@@ -503,7 +439,7 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
             save_state()
             return build_response(knn, "on", reason)
 
-        # Guard 2: test sudah selesai → jangan mulai lagi, tunggu mode berganti
+        # Guard 2: test sudah selesai → jangan mulai lagi
         if state.test_status in ("done", "lembab", "basah"):
             reason = f"[TEST] Sudah selesai ({state.test_status}), menunggu mode berganti"
             log_to_db(payload, hour, None, knn, None, reason)
@@ -543,6 +479,7 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
 
     # ── MODE MANUAL ──────────────────────────────────────────────────────────
     if state.mode == "manual":
+        # Pompa di mode manual HANYA berubah dari /control, bukan dari sensor
         reason = f"Mode MANUAL | KNN: {knn['label']}"
         log_to_db(payload, hour, None, knn, pump_action, reason)
         save_state()
@@ -584,9 +521,6 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
     save_state()
     return build_response(knn, pump_action, reason)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# POST /control
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/control")
 def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
@@ -612,6 +546,7 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         state.test_active     = False
         state.test_status     = ""
         state.test_result     = ""
+        state.test_pump_start = None
         set_pump(payload.action == "on", f"MANUAL — {payload.action}")
 
     else:  # auto
@@ -619,6 +554,7 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         state.test_active     = False
         state.test_status     = ""
         state.test_result     = ""
+        state.test_pump_start = None
         set_pump(False, "Kembali ke AUTO")
 
     save_state()
@@ -634,9 +570,6 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         },
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /history
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/history")
 def get_history(
     x_api_key : str  = Header(...),
@@ -661,10 +594,6 @@ def get_history(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# POST /test-knn, GET /test-knn/skenario, POST /test-knn/batch
-# POST /test-knn/reset, POST /test-knn/fire
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/test-knn")
 def test_knn(payload: TestPayload, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
