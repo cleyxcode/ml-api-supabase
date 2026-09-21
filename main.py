@@ -1,10 +1,10 @@
 """
-Siram Pintar API v13.4
+Siram Pintar API v13.5
 ======================
-Perubahan dari v13.3:
-  - Fix: setelah test done → mode MANUAL, pompa OFF, tidak bolak-balik
-  - Fix: guard tambahan cegah test restart saat transisi state
-  - Fix: /control reset test_status saat masuk mode baru
+Perubahan dari v13.4:
+  - Fix: check_timeout() tidak berjalan di mode MANUAL
+  - Fix: pump_start_ts di-clear saat masuk mode MANUAL via /control
+  - Fix: mode MANUAL return pump_status yang stabil (tidak berubah dari sensor)
 """
 
 import os
@@ -24,7 +24,7 @@ from supabase import create_client, Client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-VERSION      = "13.4"
+VERSION      = "13.5"
 API_KEY      = os.getenv("API_KEY",      "yuli1")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -159,6 +159,9 @@ def load_state():
         state.test_pump_start = None
         if state.mode == "test":
             state.mode = "auto"
+        # Jika mode manual saat startup, clear pump_start_ts agar tidak trigger timeout
+        if state.mode == "manual":
+            state.pump_start_ts = None
         log.info(f"[STATE] Dimuat — pump={state.pump_status} mode={state.mode}")
     except Exception as e:
         log.warning(f"[STATE] Gagal muat: {e}")
@@ -264,10 +267,18 @@ def mark_watered(window: str, today: date):
 def set_pump(on: bool, reason: str = ""):
     if on == state.pump_status: return
     state.pump_status   = on
-    state.pump_start_ts = datetime.utcnow() if on else None
+    # pump_start_ts hanya di-set saat mode AUTO (untuk timeout 20 menit)
+    # Mode MANUAL tidak butuh timeout otomatis
+    if on and state.mode == "auto":
+        state.pump_start_ts = datetime.utcnow()
+    elif not on:
+        state.pump_start_ts = None
     log.info(f"[POMPA] {'ON' if on else 'OFF'} — {reason}")
 
 def check_timeout():
+    # Timeout hanya berlaku di mode AUTO
+    if state.mode != "auto":
+        return
     if not state.pump_status or state.pump_start_ts is None:
         return
     elapsed = (datetime.utcnow() - state.pump_start_ts).total_seconds() / 60
@@ -288,6 +299,7 @@ def check_test_timeout():
         state.mode            = "manual"
         state.manual_override = True
         state.test_pump_start = None
+        state.pump_start_ts   = None
         save_state()
         log.info("[TEST] Selesai 30 detik → mode MANUAL, pompa OFF")
 
@@ -404,6 +416,7 @@ def get_pump_status(x_api_key: str = Header(...)):
 @app.post("/sensor")
 def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
+    # check_timeout hanya di AUTO (tidak boleh matikan pompa manual via timeout)
     check_timeout()
     check_test_timeout()
 
@@ -479,11 +492,12 @@ def post_sensor(payload: SensorPayload, x_api_key: str = Header(...)):
 
     # ── MODE MANUAL ──────────────────────────────────────────────────────────
     if state.mode == "manual":
-        # Pompa di mode manual HANYA berubah dari /control, bukan dari sensor
-        reason = f"Mode MANUAL | KNN: {knn['label']}"
-        log_to_db(payload, hour, None, knn, pump_action, reason)
+        # Pompa di mode MANUAL TIDAK berubah dari /sensor sama sekali
+        # Hanya berubah dari /control (dashboard)
+        reason = f"Mode MANUAL | KNN: {knn['label']} | pompa tetap {'ON' if state.pump_status else 'OFF'}"
+        log_to_db(payload, hour, None, knn, None, reason)
         save_state()
-        return build_response(knn, pump_action, reason)
+        return build_response(knn, None, reason)
 
     # ── MODE AUTO ────────────────────────────────────────────────────────────
     window = get_window(hour)
@@ -538,6 +552,7 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         state.test_result     = "Menunggu data sensor..."
         state.test_pump_start = None
         state.manual_override = False
+        state.pump_start_ts   = None  # clear timeout timer
         set_pump(False, "Masuk mode TEST")
         log.info("[TEST] Mode TEST diaktifkan dari dashboard")
 
@@ -547,7 +562,9 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         state.test_status     = ""
         state.test_result     = ""
         state.test_pump_start = None
+        state.pump_start_ts   = None  # MANUAL tidak pakai timeout otomatis
         set_pump(payload.action == "on", f"MANUAL — {payload.action}")
+        log.info(f"[MANUAL] Pompa {'ON' if payload.action == 'on' else 'OFF'} dari dashboard")
 
     else:  # auto
         state.manual_override = False
@@ -555,6 +572,7 @@ def post_control(payload: ControlPayload, x_api_key: str = Header(...)):
         state.test_status     = ""
         state.test_result     = ""
         state.test_pump_start = None
+        state.pump_start_ts   = None  # reset timer saat kembali ke AUTO
         set_pump(False, "Kembali ke AUTO")
 
     save_state()
